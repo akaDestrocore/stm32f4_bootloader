@@ -5,6 +5,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=device.x");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
     
@@ -13,6 +14,9 @@ fn main() {
     
     let memory_x = fs::read_to_string("memory.x").unwrap();
     fs::write(format!("{}/memory.x", out_dir), memory_x).unwrap();
+
+    let device_x = fs::read_to_string("device.x").unwrap();
+    fs::write(format!("{}/device.x", out_dir), device_x).unwrap();
     
     println!("cargo:rustc-link-search={}", out_dir);
     
