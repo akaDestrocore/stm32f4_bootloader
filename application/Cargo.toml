@@ -1,0 +1,15 @@
+[package]
+name = "application"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
+panic-halt = "0.2"
+shared = { path = "../shared" }
+drivers = { path = "../drivers", package = "stm32f4-drivers" }
+
+[[bin]]
+name = "application"
+path = "src/main.rs"
