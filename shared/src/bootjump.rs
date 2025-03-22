@@ -1,8 +1,9 @@
 #![no_std]
 
 use core::ptr;
-use cortex_m::asm;
 use cortex_m::peripheral::SCB;
+use cortex_m::interrupt;
+use cortex_m::register::msp;
 
 use crate::firmware::addresses;
 
@@ -17,20 +18,15 @@ pub fn jump_to_loader() -> ! {
     
     unsafe {
         // Disable interrupts
-        asm::disable_irq();
+        interrupt::disable();
         
-        // Get SCB peripheral
-        let scb = &mut *SCB::ptr();
-        
-        // Reset peripherals if needed
-        // ...
-        
-        // Set vector table to the new address
-        scb.vtor.write(addresses::LOADER_ADDR);
+        // Set vector table to the new address using the correct API
+        let scb = SCB::ptr();
+        (*scb).vtor.write(addresses::LOADER_ADDR);
         
         // Reset stack pointer
         let stack_addr = ptr::read_volatile(addresses::LOADER_ADDR as *const u32);
-        asm::msr("msp", stack_addr);
+        msp::write(stack_addr);
         
         // Jump to reset handler
         reset_vector();
@@ -38,7 +34,7 @@ pub fn jump_to_loader() -> ! {
     
     // We should never reach here
     loop {
-        asm::nop();
+        cortex_m::asm::nop();
     }
 }
 
@@ -51,19 +47,20 @@ pub fn jump_to_updater() -> ! {
     };
     
     unsafe {
-        asm::disable_irq();
+        interrupt::disable();
         
-        let scb = &mut *SCB::ptr();
-        scb.vtor.write(addresses::UPDATER_ADDR);
+        // Access VTOR register through the SCB pointer
+        let scb = SCB::ptr();
+        (*scb).vtor.write(addresses::UPDATER_ADDR);
         
         let stack_addr = ptr::read_volatile(addresses::UPDATER_ADDR as *const u32);
-        asm::msr("msp", stack_addr);
+        msp::write(stack_addr);
         
         reset_vector();
     }
     
     loop {
-        asm::nop();
+        cortex_m::asm::nop();
     }
 }
 
@@ -76,18 +73,19 @@ pub fn jump_to_app() -> ! {
     };
     
     unsafe {
-        asm::disable_irq();
+        interrupt::disable();
         
-        let scb = &mut *SCB::ptr();
-        scb.vtor.write(addresses::APP_ADDR);
+        // Access VTOR register through the SCB pointer
+        let scb = SCB::ptr();
+        (*scb).vtor.write(addresses::APP_ADDR);
         
         let stack_addr = ptr::read_volatile(addresses::APP_ADDR as *const u32);
-        asm::msr("msp", stack_addr);
+        msp::write(stack_addr);
         
         reset_vector();
     }
     
     loop {
-        asm::nop();
+        cortex_m::asm::nop();
     }
 }
