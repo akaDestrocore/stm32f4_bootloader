@@ -24,6 +24,6 @@ rem Объединение бинарных файлов
 echo Merging binary files...
 python scripts/merge_images.py boot.bin loader.bin updater.bin application.bin
 
-probe-run --chip STM32F407VGTx --download-file merged_firmware.bin
+probe-rs download --chip STM32F407VGTx --binary-format bin --base-address 0x08000000 merged_firmware.bin
 
 echo Firmware flashed successfully!

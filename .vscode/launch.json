@@ -6,7 +6,7 @@
             "type": "cortex-debug",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/stm32f4-rust-drivers",
+            "executable": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/loader",
             "servertype": "stlink",
             "device": "STM32F407VGTx",
             "interface": "swd",
