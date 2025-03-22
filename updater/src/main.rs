@@ -1,67 +1,87 @@
 #![no_std]
 #![no_main]
 
-mod vector_table;
+mod interrupts;
 
 use core::panic::PanicInfo;
-use cortex_m_rt::{entry, exception, ExceptionFrame};
+use cortex_m_rt::entry;
 
 use shared::firmware::addresses;
-use shared::bootjump::jump_to_loader;
+use shared::bootjump;
 use drivers::stm32f4_rcc::RccHandle;
 
-// The DefaultHandler definition belongs in main.rs, not vector_table.rs
-#[exception]
+// Обработчик прерываний по умолчанию
+#[cortex_m_rt::exception]
 unsafe fn DefaultHandler(_irqn: i16) {
-    // Default handler for all unhandled interrupts
     loop {
         cortex_m::asm::nop();
     }
 }
 
-fn system_init() {
-    // Initialize system clocks and peripherals
-    if let Ok(rcc) = RccHandle::new() {
-        // Configure system clock
-        // ...
+// Обработчик Hard Fault
+#[cortex_m_rt::exception]
+unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    loop {
+        cortex_m::asm::nop();
     }
-
-    // Other initialization
 }
 
+// Инициализация системы
+fn system_init() {
+    if let Ok(rcc) = RccHandle::new() {
+        // Настройка системных тактов
+        // ...
+    }
+}
+
+// Основные состояния программы обновления
+enum UpdaterState {
+    Idle,
+    ReceivingFirmware,
+    VerifyingFirmware,
+    InstallingFirmware,
+}
+
+// Точка входа в программу
 #[entry]
 fn main() -> ! {
-    // Basic system initialization
+    // Инициализация системы
     system_init();
     
-    // Check if the loader is valid
-    let loader_valid = unsafe { *(addresses::LOADER_ADDR as *const u32) != 0xFFFFFFFF };
+    // Основной цикл программы обновления
+    let mut state = UpdaterState::Idle;
     
-    if loader_valid {
-        // Jump to loader if valid
-        jump_to_loader();
-    } else {
-        // Jump to updater if loader is invalid
-        // ...
-    }
-    
-    // We should never reach here
     loop {
+        match state {
+            UpdaterState::Idle => {
+                // Ожидание команды от пользователя
+                // ...
+            }
+            UpdaterState::ReceivingFirmware => {
+                // Получение прошивки
+                // ...
+            }
+            UpdaterState::VerifyingFirmware => {
+                // Проверка прошивки
+                // ...
+            }
+            UpdaterState::InstallingFirmware => {
+                // Установка прошивки
+                // ...
+                
+                // После успешной установки перейти в загрузчик
+                bootjump::jump_to_loader();
+            }
+        }
+        
+        // Выполнение дополнительных операций в цикле
         cortex_m::asm::nop();
     }
 }
 
-#[exception]
-unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
-    // Hard fault handler
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
+// Обработчик паники
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    // Panic handler
     loop {
         cortex_m::asm::nop();
     }

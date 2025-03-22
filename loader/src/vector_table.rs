@@ -1,4 +1,4 @@
-use cortex_m_rt::interrupt;
+use cortex_m::interrupt;
 
 pub const INTERRUPT_COUNT: usize = 240;
 

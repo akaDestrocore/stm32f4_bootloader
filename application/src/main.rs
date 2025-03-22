@@ -1,67 +1,79 @@
 #![no_std]
 #![no_main]
 
-mod vector_table;
+mod interrupts;
 
 use core::panic::PanicInfo;
-use cortex_m_rt::{entry, exception, ExceptionFrame};
+use cortex_m_rt::entry;
 
 use shared::firmware::addresses;
-use shared::bootjump::jump_to_loader;
+use shared::bootjump;
 use drivers::stm32f4_rcc::RccHandle;
 
-// The DefaultHandler definition belongs in main.rs, not vector_table.rs
-#[exception]
+// Обработчик прерываний по умолчанию
+#[cortex_m_rt::exception]
 unsafe fn DefaultHandler(_irqn: i16) {
-    // Default handler for all unhandled interrupts
     loop {
         cortex_m::asm::nop();
     }
 }
 
-fn system_init() {
-    // Initialize system clocks and peripherals
-    if let Ok(rcc) = RccHandle::new() {
-        // Configure system clock
-        // ...
+// Обработчик Hard Fault
+#[cortex_m_rt::exception]
+unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    loop {
+        cortex_m::asm::nop();
     }
-
-    // Other initialization
 }
 
+// Инициализация системы
+fn system_init() {
+    if let Ok(rcc) = RccHandle::new() {
+        // Настройка системных тактов
+        // ...
+    }
+}
+
+// Структура версии прошивки
+#[repr(C, packed)]
+struct ImageVersion {
+    signature0: u32,
+    signature1: u8,
+    version_major: u8,
+    version_minor: u8,
+    version_patch: u8,
+}
+
+// Версия приложения, размещенная в специальной секции
+#[link_section = ".image_ver"]
+#[used]
+static IMAGE_VERSION: ImageVersion = ImageVersion {
+    signature0: 0xDABA,
+    signature1: 0xF,
+    version_major: 1,
+    version_minor: 2,
+    version_patch: 3,
+};
+
+// Точка входа в программу
 #[entry]
 fn main() -> ! {
-    // Basic system initialization
+    // Инициализация системы
     system_init();
     
-    // Check if the loader is valid
-    let loader_valid = unsafe { *(addresses::LOADER_ADDR as *const u32) != 0xFFFFFFFF };
-    
-    if loader_valid {
-        // Jump to loader if valid
-        jump_to_loader();
-    } else {
-        // Jump to updater if loader is invalid
+    // Основной цикл приложения
+    loop {
+        // Выполнение основной функциональности приложения
         // ...
-    }
-    
-    // We should never reach here
-    loop {
+        
+        // Предотвращение оптимизации цикла
         cortex_m::asm::nop();
     }
 }
 
-#[exception]
-unsafe fn HardFault(_ef: &ExceptionFrame) -> ! {
-    // Hard fault handler
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
+// Обработчик паники
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    // Panic handler
     loop {
         cortex_m::asm::nop();
     }
