@@ -1,50 +1,21 @@
 #![no_std]
 #![no_main]
 
-mod interrupts;
-
 use core::panic::PanicInfo;
+use cortex_m::asm;
 use cortex_m_rt::entry;
-
-use shared::firmware::addresses;
-use shared::bootjump;
-use drivers::stm32f4_rcc::RccHandle;
-
-// Обработчик прерываний по умолчанию
-#[cortex_m_rt::exception]
-unsafe fn DefaultHandler(_irqn: i16) {
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
-// Обработчик Hard Fault
-#[cortex_m_rt::exception]
-unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
-// Инициализация системы
-fn system_init() {
-    if let Ok(rcc) = RccHandle::new() {
-        // Настройка системных тактов
-        // ...
-    }
-}
 
 // Структура версии прошивки
 #[repr(C, packed)]
-struct ImageVersion {
-    signature0: u32,
-    signature1: u8,
-    version_major: u8,
-    version_minor: u8,
-    version_patch: u8,
+pub struct ImageVersion {
+    pub signature0: u32,
+    pub signature1: u8,
+    pub version_major: u8,
+    pub version_minor: u8,
+    pub version_patch: u8,
 }
 
-// Версия приложения, размещенная в специальной секции
+// Версия приложения
 #[link_section = ".image_ver"]
 #[used]
 static IMAGE_VERSION: ImageVersion = ImageVersion {
@@ -55,26 +26,19 @@ static IMAGE_VERSION: ImageVersion = ImageVersion {
     version_patch: 3,
 };
 
-// Точка входа в программу
 #[entry]
 fn main() -> ! {
-    // Инициализация системы
-    system_init();
-    
-    // Основной цикл приложения
+    // Основная функциональность приложения
+    // В минимальном варианте просто бесконечный цикл
     loop {
-        // Выполнение основной функциональности приложения
-        // ...
-        
-        // Предотвращение оптимизации цикла
-        cortex_m::asm::nop();
+        asm::nop();
     }
 }
 
-// Обработчик паники
+#[inline(never)]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {
-        cortex_m::asm::nop();
+        asm::nop();
     }
 }

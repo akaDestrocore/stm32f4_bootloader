@@ -1,15 +1,9 @@
 [package]
 name = "updater"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = { version = "0.7", default-features = false }
 panic-halt = "0.2"
-shared = { path = "../shared" }
-drivers = { path = "../drivers", package = "stm32f4-drivers" }
-
-[[bin]]
-name = "updater"
-path = "src/main.rs"

@@ -9,8 +9,6 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "panic-halt",
- "shared",
- "stm32f4-drivers",
 ]
 
 [[package]]
@@ -35,8 +33,6 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "panic-halt",
- "shared",
- "stm32f4-drivers",
 ]
 
 [[package]]
@@ -88,8 +84,6 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "panic-halt",
- "shared",
- "stm32f4-drivers",
 ]
 
 [[package]]
@@ -160,6 +154,7 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "cortex-m-rt",
  "stm32f4-drivers",
 ]
 
@@ -195,8 +190,6 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "panic-halt",
- "shared",
- "stm32f4-drivers",
 ]
 
 [[package]]

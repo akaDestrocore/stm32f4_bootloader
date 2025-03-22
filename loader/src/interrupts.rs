@@ -1,6 +1,6 @@
 //! Обработчики прерываний по умолчанию для STM32F4xx
 
-use cortex_m::interrupt;
+use cortex_m_rt::interrupt;
 
 // Определяем все прерывания STM32F4
 #[interrupt]

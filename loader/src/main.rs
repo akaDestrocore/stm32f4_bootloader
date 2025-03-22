@@ -1,66 +1,65 @@
 #![no_std]
 #![no_main]
 
-mod interrupts;
-
 use core::panic::PanicInfo;
+use core::ptr;
+use cortex_m::asm;
 use cortex_m_rt::entry;
 
-use shared::firmware::addresses;
-use shared::bootjump;
-use drivers::stm32f4_rcc::RccHandle;
+// Константы для адресов
+const APP_ADDR: u32 = 0x08020000;
+const UPDATER_ADDR: u32 = 0x08008000;
 
-// Обработчик прерываний по умолчанию
-#[cortex_m_rt::exception]
-unsafe fn DefaultHandler(_irqn: i16) {
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
-// Обработчик Hard Fault
-#[cortex_m_rt::exception]
-unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
-// Инициализация системы
-fn system_init() {
-    if let Ok(rcc) = RccHandle::new() {
-        // Настройка системных тактов
-        // ...
-    }
-}
-
-// Точка входа в программу
 #[entry]
 fn main() -> ! {
-    // Инициализация системы
-    system_init();
-    
     // Проверка валидности приложения
-    let app_valid = unsafe { *(addresses::APP_ADDR as *const u32) != 0xFFFFFFFF };
+    let app_valid = unsafe { *(APP_ADDR as *const u32) != 0xFFFFFFFF };
     
     if app_valid {
-        // Переход в приложение если оно валидно
-        bootjump::jump_to_app();
+        jump_to_address(APP_ADDR);
     } else {
-        // Переход в программу обновления если приложение не валидно
-        bootjump::jump_to_updater();
+        jump_to_address(UPDATER_ADDR);
     }
     
-    // Этот код никогда не должен выполняться
+    // Этот код никогда не должен выполниться
     loop {
-        cortex_m::asm::nop();
+        asm::nop();
     }
 }
 
-// Обработчик паники
+// Простая функция для перехода по адресу
+fn jump_to_address(addr: u32) -> ! {
+    unsafe {
+        // Отключаем прерывания
+        cortex_m::interrupt::disable();
+        
+        // Устанавливаем таблицу векторов
+        let scb = cortex_m::peripheral::SCB::ptr();
+        (*scb).vtor.write(addr);
+        
+        // Устанавливаем указатель стека
+        let stack_ptr = *(addr as *const u32);
+        cortex_m::register::msp::write(stack_ptr);
+        
+        // Получаем адрес функции сброса
+        let reset_addr = addr + 4;
+        let reset_ptr = *(reset_addr as *const u32);
+        
+        // Переходим к функции
+        let jump_fn: fn() -> ! = core::mem::transmute(reset_ptr);
+        jump_fn();
+    }
+    
+    // Код должен быть недостижим
+    loop {
+        asm::nop();
+    }
+}
+
+#[inline(never)]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {
-        cortex_m::asm::nop();
+        asm::nop();
     }
 }

@@ -1,30 +1,22 @@
 use std::env;
-use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=memory.x");
-    println!("cargo:rerun-if-changed=device.x");
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src");
+    let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
     
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let target_name = env::var("CARGO_PKG_NAME").unwrap();
+    // Копируем memory.x
+    File::create(out.join("memory.x"))
+        .unwrap()
+        .write_all(include_bytes!("memory.x"))
+        .unwrap();
     
-    let memory_x = fs::read_to_string("memory.x").unwrap();
-    fs::write(format!("{}/memory.x", out_dir), memory_x).unwrap();
-
-    let device_x = fs::read_to_string("device.x").unwrap();
-    fs::write(format!("{}/device.x", out_dir), device_x).unwrap();
+    // Копируем device.x
+    File::create(out.join("device.x"))
+        .unwrap()
+        .write_all(include_bytes!("device.x"))
+        .unwrap();
     
-    println!("cargo:rustc-link-search={}", out_dir);
-    
-    // Post-build commands to create binary
-    let target_dir = Path::new(&out_dir).ancestors().nth(4).unwrap();
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    let elf_path = target_dir.join(format!("{}/{}", profile, target_name));
-    
-    println!("cargo:warning=Building binary from {}", elf_path.display());
-
+    println!("cargo:rustc-link-search={}", out.display());
 }

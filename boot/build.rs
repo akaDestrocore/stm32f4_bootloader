@@ -1,21 +1,22 @@
 use std::env;
-use std::fs;
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
-    // Выводим инструкции для cargo перестроить при изменении этих файлов
-    println!("cargo:rerun-if-changed=memory.x");
-    println!("cargo:rerun-if-changed=device.x");
-    println!("cargo:rerun-if-changed=build.rs");
-    
-    // Устанавливаем переменную среды для cortex-m-rt
-    println!("cargo:rustc-link-search={}", env::var("OUT_DIR").unwrap());
-    
-    // Копируем memory.x в каталог OUT_DIR
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    fs::copy("memory.x", out.join("memory.x")).unwrap();
-    fs::copy("device.x", out.join("device.x")).unwrap();
     
-    // Только для отладки - сообщаем местоположение memory.x
-    println!("cargo:warning=memory.x location: {}", out.join("memory.x").display());
+    // Копируем memory.x
+    File::create(out.join("memory.x"))
+        .unwrap()
+        .write_all(include_bytes!("memory.x"))
+        .unwrap();
+    
+    // Копируем device.x
+    File::create(out.join("device.x"))
+        .unwrap()
+        .write_all(include_bytes!("device.x"))
+        .unwrap();
+    
+    println!("cargo:rustc-link-search={}", out.display());
 }
