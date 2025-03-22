@@ -22,9 +22,4 @@ fn main() {
     let elf_path = target_dir.join(format!("{}/{}", profile, target_name));
     
     println!("cargo:warning=Building binary from {}", elf_path.display());
-    
-    // Run objcopy after build to create the binary
-    if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-arg=-Wl,--print-memory-usage");
-    }
 }
