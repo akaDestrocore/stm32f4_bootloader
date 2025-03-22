@@ -12,7 +12,7 @@ use drivers::stm32f4_rcc::RccHandle;
 
 // The DefaultHandler definition belongs in main.rs, not vector_table.rs
 #[exception]
-fn DefaultHandler(_irqn: i16) {
+unsafe fn DefaultHandler(_irqn: i16) {
     // Default handler for all unhandled interrupts
     loop {
         cortex_m::asm::nop();
