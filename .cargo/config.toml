@@ -3,6 +3,7 @@ runner = "probe-run --chip STM32F407VGTx"
 rustflags = [
   "-C", "link-arg=-Tlink.x",
   "-C", "link-arg=--nmagic",
+  "--cfg", "feature=\"cortex-m-rt/no-device\"",
 ]
 
 [build]
