@@ -2,16 +2,35 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Cargo Build Debug",
+            "label": "Build Boot",
             "type": "shell",
-            "command": "cargo build",
+            "command": "Push-Location boot; cargo build; Pop-Location",
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": [
-                "$rustc"
-            ]
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Build Loader",
+            "type": "shell",
+            "command": "Push-Location loader; cargo build; Pop-Location",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Build Updater",
+            "type": "shell",
+            "command": "Push-Location updater; cargo build; Pop-Location",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Build Application",
+            "type": "shell",
+            "command": "Push-Location application; cargo build; Pop-Location",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
         }
     ]
 }
