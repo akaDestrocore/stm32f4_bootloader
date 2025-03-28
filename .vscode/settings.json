@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.diagnostics.disabled": [
+        "unlinked-file"
+    ],
+    "cortex-debug.variableUseNaturalFormat": false
+}

@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build All Release",
+            "type": "shell",
+            "command": "${workspaceFolder}/build.ps1",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Build All Debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/build.ps1 debug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Build Boot Debug",
+            "type": "shell",
+            "command": "cargo build -p boot",
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Build Loader Debug",
+            "type": "shell",
+            "command": "cargo build -p loader",
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Build Updater Debug",
+            "type": "shell",
+            "command": "cargo build -p updater",
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Build Application Debug",
+            "type": "shell",
+            "command": "cargo build -p application",
+            "group": "build",
+            "problemMatcher": ["$rustc"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        }
+    ]
+}
