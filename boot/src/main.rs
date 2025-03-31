@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
-use cortex_m::{asm, peripheral::{self, SCB, SYST}, register::{msp, psp}};
+use core::{f32::consts, panic::PanicInfo};
+use cortex_m::{asm, peripheral::{self, scb, SCB, SYST}};
 use cortex_m_rt::entry;
-use stm32f4 as pac;
+use stm32f4::{self as pac, Peripherals};
 
 const LOADER_ADDR: u32 = 0x08004000;
 const UPDATER_ADDR: u32 = 0x08008000;
@@ -12,45 +12,50 @@ const UPDATER_ADDR: u32 = 0x08008000;
 #[entry]
 fn main() -> ! {
 
-    let p: stm32f4::Peripherals = pac::Peripherals::take().unwrap();
-    let mut cp: cortex_m::Peripherals = cortex_m::Peripherals::take().unwrap();
+    let peripherals = pac::Peripherals::take();
 
-    system_clock_config(&p);
+    if let Some(p) = peripherals {
+        setup_system_clock(&p);
 
-    let loader_is_valid: bool = unsafe {
-        let loader_value: u32 = *{LOADER_ADDR as *const u32};
-        0xFFFFFFFF != loader_value
-    };
+        let loader_is_valid: bool = check_loader_valid();
+        
+        prepare_for_jump(&p);
 
-    if !loader_is_valid {
-        jump_to_updater(&p, &mut cp);
-    } else {
-        jump_to_loader(&p, &mut cp);
+        if loader_is_valid {
+            jump_to_image(LOADER_ADDR);
+        } else {
+            jump_to_image(UPDATER_ADDR);
+        }
     }
-
 
     loop {
         asm::nop();
     }
 }
 
-fn system_clock_config(p: &pac::Peripherals) {
-    let rcc = &p.rcc;
-    let pwr = &p.pwr;
-    let flash = &p.flash;
-    
-    // PWREN
-    rcc.apb1enr().modify(|_, w| w.pwren().set_bit());
-    // Enable VOS 1
-    pwr.cr().modify(|_, w| w.vos().set_bit());
+fn setup_system_clock(p: &Peripherals) {
+    // PWR clock
+    p.rcc.apb1enr().modify(|_, w| w.pwren().set_bit());
+
+    // Scale 1
+    p.pwr.cr().modify(|_, w| w.vos().scale1());
+
+    // flash latency
+    p.flash.acr().modify(|_, w| w
+        .latency().ws5()
+        .prften().set_bit()
+        .icen().set_bit()
+        .dcen().set_bit()
+    );
+
     // Enable HSE
-    rcc.cr().modify(|_, w| w.hseon().set_bit());
-    while rcc.cr().read().hserdy().bit_is_clear() {
+    p.rcc.cr().modify(|_, w| w.hseon().set_bit());
+    while p.rcc.cr().read().hserdy().bit_is_clear() {
         // wait
     }
 
     // PLL configuration
-    rcc.pllcfgr().modify(|_, w| unsafe {
+    p.rcc.pllcfgr().modify(|_, w| unsafe {
         w.pllsrc().hse()
         .pllm().bits(4)
         .plln().bits(90)
@@ -59,156 +64,149 @@ fn system_clock_config(p: &pac::Peripherals) {
     });
 
     // Enable PLL
-    rcc.cr().modify(|_, w| w.pllon().set_bit());
-    while rcc.cr().read().pllrdy().bit_is_clear() {
+    p.rcc.cr().modify(|_, w| w.pllon().set_bit());
+    while p.rcc.cr().read().pllrdy().bit_is_clear() {
         // wait
     }
 
     // bus dividers
-    rcc.cfgr().modify(|_, w| {
+    p.rcc.cfgr().modify(|_, w| {
         w.hpre().div1()
         .ppre1().div4()
         .ppre2().div2()
     });
 
-    // Flash latency
-    flash.acr().modify(|_, w| unsafe {
-        w.latency().bits(5)
-        .prften().set_bit()
-        .icen().set_bit()
-        .dcen().set_bit()
+    // PLL as sys clock
+    p.rcc.cfgr().modify(|_, w| w.sw().pll());
+    while !p.rcc.cfgr().read().sws().is_pll() {
+        // wait
+    }
+}
+
+fn check_loader_valid() -> bool {
+    unsafe {
+        let loader_value: u32 = *(LOADER_ADDR as *const u32);
+        0xFFFFFFFF != loader_value
+    }
+}
+
+fn prepare_for_jump(p: &Peripherals) {
+    // Reset clock
+    p.rcc.cr().modify(|_, w| w.hsion().set_bit());
+    while p.rcc.cr().read().hsirdy().bit_is_clear() {
+        // wait
+    }
+
+    // Set HSITRIM[4:0] bits to the reset value
+    p.rcc.cr().modify(|_, w| unsafe {
+        w.hsitrim().bits(0x10)
     });
 
-    // Make PLL system clock
-    rcc.cfgr().modify(|_, w| w.sw().pll());
-    while !rcc.cfgr().read().sws().is_pll() {
-        // wait
-    }
-
-}
-
-fn jump_to_updater(p: &pac::Peripherals, cp: &mut cortex_m::Peripherals) -> ! {
-    
-    let reset_addr: u32 = UPDATER_ADDR + 4;
-    let reset_ptr: u32 = unsafe { *(reset_addr as *const u32) };
-    let stack_ptr: u32 = unsafe { *(UPDATER_ADDR as *const u32) };
-
     p.rcc.cfgr().reset();
-    p.rcc.cr().modify(|_, w| w.hsion().set_bit());
-    
-    // Wait for HSI to be ready
-    while p.rcc.cr().read().hsirdy().bit_is_clear() {
-        // wait
-    }
-    
-    p.rcc.cr().modify(|_, w| w
-        .hseon().clear_bit()
-        .pllon().clear_bit()
-    );
     while !p.rcc.cfgr().read().sws().is_hsi() {
         // wait
     }
-    
-    p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
 
-    // remap
-    unsafe {
-        p.syscfg.memrmp().write(|w| w.bits(0x01));
-    }
-    
-    
-    // Disable SysTick
-    let systick: &mut SYST = &mut cp.SYST;
-    systick.disable_counter();
-    systick.disable_interrupt();
-    
-    // Clear pendSV
-    unsafe {
-        let scb: *mut peripheral::scb::RegisterBlock = SCB::PTR as *mut _;
-        let icsr: u32 = (*scb).icsr.read();
-        (*scb).icsr.write(icsr | (1 << 25)); // PENDSTCLR bit
-    }
-    
-    unsafe {
-        let scb: *mut peripheral::scb::RegisterBlock = SCB::PTR as *mut _;
-        (*scb).shcsr.modify(|v| v & !(
-            (1 << 18) | // USGFAULTENA
-            (1 << 17) | // BUSFAULTENA 
-            (1 << 16)   // MEMFAULTENA
-        ));
-        
-        // Set vector table offset
-        (*scb).vtor.write(UPDATER_ADDR);
-        
-        // SP
-        core::arch::asm!("MSR msp, {0}", in(reg) stack_ptr);
-        
-        let jump_fn: unsafe extern "C" fn() -> ! = core::mem::transmute(reset_ptr);
-        jump_fn();
-    }
-    
-}
-
-fn jump_to_loader(p: &pac::Peripherals, cp: &mut cortex_m::Peripherals) -> ! {
-    
-    let reset_addr: u32 = LOADER_ADDR + 4;
-    let reset_ptr: u32 = unsafe { *(reset_addr as *const u32) };
-    let stack_ptr: u32 = unsafe { *(LOADER_ADDR as *const u32) };
-
-    p.rcc.cfgr().reset();
-    p.rcc.cr().modify(|_, w| w.hsion().set_bit());
-    
-    // Wait for HSI to be ready
-    while p.rcc.cr().read().hsirdy().bit_is_clear() {
-        // wait
-    }
-    
     p.rcc.cr().modify(|_, w| w
         .hseon().clear_bit()
-        .pllon().clear_bit()
+        .hsebyp().clear_bit()
+        .csson().clear_bit()
     );
-    while !p.rcc.cfgr().read().sws().is_hsi() {
+    while p.rcc.cr().read().hserdy().bit_is_set() {
         // wait
     }
-    
-    p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
+
+    //reset PLL
+    p.rcc.cr().modify(|_, w| w.pllon().clear_bit());
+    while p.rcc.cr().read().pllrdy().bit_is_set() {
+        // wait
+    }
+
+    // reset PLL configuration
+    p.rcc.pllcfgr().modify(|_, w| unsafe {
+        w.pllm().bits(0x10)
+        .plln().bits(0x040)
+        .pllp().bits(0x080)
+        .pllq().bits(0x4)
+    });
+
+    // disable all interrupts
+    p.rcc.cir().modify(|_, w| w
+        .lsirdyie().clear_bit()
+        .lserdyie().clear_bit()
+        .hsirdyie().clear_bit()
+        .pllrdyie().clear_bit()
+    );
+    p.rcc.cir().modify(|_, w| w
+        .lsirdyc().clear_bit()
+        .lserdyc().clear_bit()
+        .hsirdyc().clear_bit()
+        .pllrdyc().clear_bit()
+    );
+
+    // reset all CSR flags
+    p.rcc.csr().modify(|_, w| w.rmvf().set_bit());
+
+    // force reset for all peripherals
+    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0xF6FEC9FF) });
+    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0x0) });
+
+    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x04777933) });
+    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x0) });
+
+    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x226011FF) });
+    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x0) });
+
+    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x000000C1) });
+    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x0) });
+
+    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x00000001) });
+    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x0) });
 
     // remap
+    p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
+    p.syscfg.memrmp().write(|w| unsafe {
+        w.bits(0x01)
+    });
+
+}
+
+fn jump_to_image(addr: u32) -> ! {
+    let reset_addr: u32 = addr + 4;
+    let stack_addr: u32 = unsafe {
+        *(addr as *const u32)
+    };
+    let reset_vector: u32 = unsafe {
+        *(reset_addr as *const u32)
+    };
+
+    // disable SysTick
+    let mut cp: cortex_m::Peripherals = unsafe {
+        cortex_m::Peripherals::steal()
+    };
+    cp.SYST.disable_counter();
+    cp.SYST.disable_interrupt();
+
+    // Clear pending SV
     unsafe {
-        p.syscfg.memrmp().write(|w| w.bits(0x01));
-    }
-    
-    
-    // Disable SysTick
-    let systick: &mut SYST = &mut cp.SYST;
-    systick.disable_counter();
-    systick.disable_interrupt();
-    
-    // Clear pendSV
-    unsafe {
-        let scb: *mut peripheral::scb::RegisterBlock = SCB::PTR as *mut _;
+        let scb = SCB::ptr();
         let icsr: u32 = (*scb).icsr.read();
-        (*scb).icsr.write(icsr | (1 << 25)); // PENDSTCLR bit
-    }
-    
-    unsafe {
-        let scb: *mut peripheral::scb::RegisterBlock = SCB::PTR as *mut _;
-        (*scb).shcsr.modify(|v| v & !(
-            (1 << 18) | // USGFAULTENA
-            (1 << 17) | // BUSFAULTENA 
-            (1 << 16)   // MEMFAULTENA
+        (*scb).icsr.write(icsr | (1 << 25));
+
+        // disable fault handlers
+        (*scb).shcsr.modify(|v: u32| v & ! (
+            (1 << 18) | (1 << 17) | (1 << 16)
         ));
-        
-        // Set vector table offset
-        (*scb).vtor.write(LOADER_ADDR);
-        
-        // SP
-        core::arch::asm!("MSR msp, {0}", in(reg) stack_ptr);
-        
-        let jump_fn: unsafe extern "C" fn() -> ! = core::mem::transmute(reset_ptr);
+
+        // vector table
+        (*scb).vtor.write(addr);
+
+        // set msp
+        core::arch::asm!("MSR msp, {0}", in(reg) stack_addr);
+
+        let jump_fn: extern "C" fn() -> ! = core::mem::transmute(reset_vector);
         jump_fn();
     }
-    
 }
 
 #[panic_handler]
