@@ -5,13 +5,14 @@ use core::{f32::consts, panic::PanicInfo};
 use cortex_m::{asm, peripheral::{self, scb, SCB, SYST}};
 use cortex_m_rt::entry;
 use stm32f4::{self as pac, Peripherals};
+use misc::image::{ImageHeader, IMAGE_MAGIC_LOADER, IMAGE_MAGIC_UPDATER};
 
 const LOADER_ADDR: u32 = 0x08004000;
 const UPDATER_ADDR: u32 = 0x08008000;
+const IMAGE_HEADER_SIZE: usize = core::mem::size_of::<ImageHeader>();
 
 #[entry]
 fn main() -> ! {
-
     let peripherals = pac::Peripherals::take();
 
     if let Some(p) = peripherals {
@@ -85,12 +86,19 @@ fn setup_system_clock(p: &Peripherals) {
 
 fn check_loader_valid() -> bool {
     unsafe {
-        let loader_value: u32 = *(LOADER_ADDR as *const u32);
-        0xFFFFFFFF != loader_value
+        let header_ptr: *const ImageHeader = LOADER_ADDR as *const ImageHeader;
+        
+        // check if magic is correct
+        if (*header_ptr).image_magic == IMAGE_MAGIC_LOADER {
+            return true;
+        }
+        
+        // if magic is incorrect then loader is corrupted
+        false
     }
 }
 
-fn prepare_for_jump(p: &Peripherals) {
+fn rcc_deinit(p: &Peripherals) {
     // Reset clock
     p.rcc.cr().modify(|_, w| w.hsion().set_bit());
     while p.rcc.cr().read().hsirdy().bit_is_clear() {
@@ -146,7 +154,9 @@ fn prepare_for_jump(p: &Peripherals) {
 
     // reset all CSR flags
     p.rcc.csr().modify(|_, w| w.rmvf().set_bit());
+}
 
+fn deinit(p: &Peripherals) {
     // force reset for all peripherals
     p.rcc.apb1rstr().write(|w| unsafe { w.bits(0xF6FEC9FF) });
     p.rcc.apb1rstr().write(|w| unsafe { w.bits(0x0) });
@@ -162,22 +172,31 @@ fn prepare_for_jump(p: &Peripherals) {
 
     p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x00000001) });
     p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x0) });
+}
+
+fn prepare_for_jump(p: &Peripherals) {
+    
+    rcc_deinit(p);
+    deinit(p);
 
     // remap
     p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
     p.syscfg.memrmp().write(|w| unsafe {
         w.bits(0x01)
     });
-
 }
 
 fn boot_to_image(addr: u32) -> ! {
-    let reset_addr: u32 = addr + 4;
+    let vectors_addr: u32 = addr + 0x200;
+    
+    // SP
     let stack_addr: u32 = unsafe {
-        *(addr as *const u32)
+        *(vectors_addr as *const u32)
     };
+    
+    // reset handler
     let reset_vector: u32 = unsafe {
-        *(reset_addr as *const u32)
+        *((vectors_addr + 4) as *const u32)
     };
 
     // disable SysTick
@@ -199,7 +218,7 @@ fn boot_to_image(addr: u32) -> ! {
         ));
 
         // vector table
-        (*scb).vtor.write(addr);
+        (*scb).vtor.write(vectors_addr);
 
         // set msp
         core::arch::asm!("MSR msp, {0}", in(reg) stack_addr);
