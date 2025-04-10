@@ -1,159 +1,824 @@
 #![no_std]
 #![no_main]
 
-use core::{
-    cell::UnsafeCell, iter::Cycle, panic::PanicInfo, sync::atomic::{AtomicBool, AtomicU32, Ordering}
-};
+mod led;
+mod uart;
 
-use cortex_m::{
-    asm,
-    peripheral::{self, NVIC, SCB, SYST}
-};
+include!(concat!(env!("OUT_DIR"), "/header_values.rs"));
 
+use misc::{
+    bootloader::{self, BootOption, BootConfig},
+    xmodem::{XmodemManager, XmodemConfig, XmodemError, XmodemState, CAN},
+    image::{SharedMemory, IMAGE_MAGIC_LOADER, IMAGE_TYPE_LOADER},
+    systick,
+};
+use core::panic::PanicInfo;
+use cortex_m::{asm, peripheral::SYST};
 use cortex_m_rt::{entry, exception};
-use stm32f4::{self as pac, ethernet_ptp::ptpppscr, Peripherals, Usart2};
-use misc::RingBuffer;
+use led::Leds;
+use stm32f4 as pac;
+use stm32f4::Peripherals;
+use uart::{UartManager, UartError};
 
-pub struct Mutex<T> {
-    inner: UnsafeCell<T>
+// Flash memory addresses
+pub const UPDATER_ADDR: u32 = 0x08008000;
+pub const APP_ADDR: u32 = 0x08020000;
+pub const LOADER_ADDR: u32 = 0x08004000;
+pub const IMAGE_HDR_SIZE: u32 = 0x200;
+pub const BOOT_TIMEOUT_MS: u32 = 10_000;
+
+// Time in which Enter key press is ignored (because 
+// ExtraPuTTY sends Enter after XMODEM, but I want to use this key)
+const ENTER_BLOCK_AFTER_UPDATE_MS: u32 = 3_000;
+static mut ENTER_BLOCKED_UNTIL: u32 = 0;
+
+// Added state for PostXmodem recovery
+#[derive(PartialEq, Copy, Clone)]
+enum PostXmodemState {
+    Initial,
+    Recovering,
+    Complete
 }
 
-unsafe impl<T> Sync for Mutex<T> {
-    // access to data is protected by critical sections
+#[no_mangle]
+#[link_section = ".shared_memory"]
+pub static mut SHARED_MEMORY: SharedMemory = SharedMemory::new();
+
+unsafe extern "C" {
+    unsafe static __firmware_size: u32;
 }
 
-impl<T> Mutex<T> {
-    pub const fn new(value: T) -> Self {
-        Self { inner: UnsafeCell::new(value)}
+fn calculate_crc32(start_addr: u32, size: u32) -> u32 {
+    let mut crc: u32 = 0xFFFFFFFF;
+    
+    for i in 0..size {
+        let byte: u8 = unsafe { *(start_addr as *const u8).offset(i as isize) };
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    
+    !crc
+}
+
+// ANSI escape
+fn clear_screen(uart: &mut UartManager) {
+    uart.send_string("\x1B[2J\x1B[1;1H");
+
+    for _ in 0..5 {
+        uart.process();
+    }
+}
+
+fn display_menu(uart: &mut UartManager) {
+    clear_screen(uart);
+    
+    uart.send_string("\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+    uart.send_string("xxxxxxxx  xxxxxxxxxxxxxxxxxxxx  xxxxxxxxx\r\n");
+    uart.send_string("xxxxxxxxxx  xxxxxxxxxxxxxxxxx  xxxxxxxxxx\r\n");
+    uart.send_string("xxxxxx  xxx  xxxxxxxxxxxxxxx  xx   xxxxxx\r\n");
+    uart.send_string("xxxxxxxx  xx  xxxxxxxxxxxxx  xx  xxxxxxxx\r\n");
+    uart.send_string("xxxx  xxx   xxxxxxxxxxxxxxxxx  xxx  xxxxx\r\n");
+    uart.send_string("xxxxxx    xxxx  xxxxxxxx  xxx     xxxxxxx\r\n");
+    uart.send_string("xxxxxxxx xxxxx xx      xx xxxx  xxxxxxxxx\r\n");
+    uart.send_string("xxxx     xxxxx   xx  xx   xxxxx     xxxxx\r\n");
+    uart.send_string("xxxxxxxx xxxxxxxxxx  xxxxxxxxxx  xxxxxxxx\r\n");
+    uart.send_string("xxxxx    xxxxxx  xx  xx  xxxxxx    xxxxxx\r\n");
+    uart.send_string("xxxxxxxx  xxxx xxxx  xxxx xxxxx xxxxxxxxx\r\n");
+    uart.send_string("xxxxxxx    xxx  xxx  xxx  xxx    xxxxxxxx\r\n");
+    uart.send_string("xxxxxxxxxx   xxxxxx  xxxxxx   xxxxxxxxxxx\r\n");
+    uart.send_string("xxxxxxxxxxxxxx             xxxxxxxxxxxxxx\r\n");
+    uart.send_string("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n\r\n");
+    uart.send_string("Press 'Enter' to boot application\r\n");
+    uart.send_string("Press 'I' to get information about system state\r\n");
+    uart.send_string("Press 'F' to update firmware using XMODEM(CRC)\r\n");
+    uart.send_string("Press 'U' to enter updater\r\n");
+    uart.send_string("Will boot automatically in 10 seconds\r\n");
+    
+    for _ in 0..10 {
+        uart.process();
+    }
+}
+
+fn check_application_valid(uart: &mut UartManager, boot_config: &BootConfig) -> bool {
+    bootloader::is_firmware_valid(APP_ADDR, boot_config)
+}
+
+// needed to work in ExtraPuTTY properly
+fn is_enter_blocked(current_time: u32) -> bool {
+    unsafe {
+        if ENTER_BLOCKED_UNTIL > current_time {
+            return true;
+        }
+        false
+    }
+}
+
+fn block_enter_temporarily(current_time: u32) {
+    unsafe {
+        ENTER_BLOCKED_UNTIL = current_time + ENTER_BLOCK_AFTER_UPDATE_MS;
+    }
+}
+
+fn send_cancel_sequence(uart: &mut UartManager) {
+    // XMODEM cancel sequence
+    uart.send_byte(CAN);
+    uart.send_byte(CAN);
+    uart.send_byte(CAN);
+
+    while !uart.is_tx_complete() {
+        uart.process();
     }
 
-    pub fn get<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        // always call inside the critical section
-        cortex_m::interrupt::free(|_| {
-            let ptr: *mut T = self.inner.get();
-            f(unsafe {
-                &mut *ptr
-            })
-        })
+    let start_time: u32 = systick::get_tick_ms();
+    while !systick::wait_ms(start_time, 1000) {
+        uart.process();
+    }
+
+    for _ in 0..30 {
+        uart.process();
     }
 }
 
-const SLOT_2_APP_ADDR: u32 = 0x08020200;
-const UPDATER_ADDR: u32 = 0x08008000;
-const SLOT_2_VER_ADDR: u32 = 0x08020000;
-const BOOT_TIMEOUT_MS: u32 = 10_000; // 10 sec
+fn recover_from_xmodem(uart: &mut UartManager, leds: &mut Leds, block_enter: bool) -> u32 {
+    
+    clear_rx_buffer(uart);
+    let start_time: u32 = systick::get_tick_ms();
+    systick::wait_ms(start_time, 3000);
+    for _ in 0..50 {
+        uart.process();
+    }
+    
+    // clear screen
+    clear_screen(uart);
+    systick::wait_ms(systick::get_tick_ms(), 500);
 
-// systick counter
-static TICK_MS: AtomicU32 = AtomicU32::new(0);
-
-// pointer wrappers
-struct PeripheralPtr<T>(*const T);
-unsafe impl<T> Send for PeripheralPtr<T> {}
-unsafe impl<T> Sync for PeripheralPtr<T> {}
-
-static TX_BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
-static RX_BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
-static TX_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static LOAD_APPLICATION: AtomicBool = AtomicBool::new(false);
-static START_TIME: Mutex<u32> = Mutex::new(0);
-
-// handle like logic - using global pointers for periph
-static USART2_PTR: Mutex<Option<PeripheralPtr<pac::usart2::RegisterBlock>>> =
-    Mutex::new(None);
-static GPIOD_PTR: Mutex<Option<PeripheralPtr<pac::gpiod::RegisterBlock>>> =
-    Mutex::new(None);
+    for _ in 0..50 {
+        uart.process();
+    }
+    
+    // block '\r' for proper functionality in ExtraPuTTY
+    block_enter_temporarily(systick::get_tick_ms());
+    
+    // reset autoboot
+    let new_autoboot_time: u32 = systick::get_tick_ms();
+    
+    // display main menu
+    display_menu(uart);
+    for _ in 0..50 {
+        uart.process();
+    }
+    
+    while !uart.is_tx_complete() {
+        uart.process();
+    }
+    
+    // return new time for timeout
+    new_autoboot_time
+}
 
 #[entry]
 fn main() -> ! {
-    
-    let p: Peripherals = match pac::Peripherals::take() {
-        Some(p) => p,
-        None => {
-            loop {
-                asm::nop();
-            }
-        }
+    let p: Peripherals = pac::Peripherals::take().unwrap();
+    let mut cp: cortex_m::Peripherals = cortex_m::Peripherals::take().unwrap();
+
+    // Create configuration objects
+    let boot_config: BootConfig = BootConfig {
+        app_addr: APP_ADDR,
+        updater_addr: UPDATER_ADDR,
+        loader_addr: LOADER_ADDR,
+        image_hdr_size: IMAGE_HDR_SIZE,
     };
     
-    let mut cp: cortex_m::Peripherals = match cortex_m::Peripherals::take() {
-        Some(cp) => cp,
-        None => {
-            loop {
-                asm::nop();
-            }
-        }
+    let xmodem_config: XmodemConfig = XmodemConfig {
+        app_addr: APP_ADDR,
+        updater_addr: UPDATER_ADDR,
+        loader_addr: LOADER_ADDR,
+        image_hdr_size: IMAGE_HDR_SIZE,
     };
-
-    // clock setup
-    setup_system_clock(&p);
-
-    // get current time
-    let current_ms: u32 = TICK_MS.load(Ordering::Relaxed);
-    START_TIME.get(|time: &mut u32| *time = current_ms);
-
-    setup_systick(&mut cp.SYST);
-
-    setup_gpio(&p);
-
-    setup_usart(&p);
-
-    let usart2_ptr: &stm32f4::usart2::RegisterBlock = unsafe {
-        &*(p.usart2.sr().as_ptr() as *const _ as *const pac::usart2::RegisterBlock)
-    };
-    USART2_PTR.get(|ptr| *ptr = Some(PeripheralPtr(usart2_ptr)));
-
-    let gpiod_ptr: &stm32f4::gpiod::RegisterBlock = unsafe { 
-        &*(p.gpiod.bsrr().as_ptr() as *const _ as *const pac::gpiod::RegisterBlock)
-    };
-    GPIOD_PTR.get(|ptr| *ptr = Some(PeripheralPtr(gpiod_ptr)));
-
-    send_welcome_message_polling(&p);
 
     unsafe {
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
-
-        // enable USART2 interrupts
-        p.usart2.cr1().modify(|_, w| w
-            .rxneie().enabled()
-            .txeie().enabled()
-        );
+        // Get firmware size from linker script
+        let size: *const u32 = &__firmware_size as *const u32;
+        let firmware_size: u32 = *size;
+        
+        // Update only the size in the header
+        IMAGE_HEADER.update_data_size(firmware_size);
+        
+        // TODO: IMAGE_HEADER.crc
     }
 
-    loop {
-        process_input();
+    // Setup system clock to 90MHz
+    setup_system_clock(&p);
 
-        if LOAD_APPLICATION.load(Ordering::SeqCst) {
-            boot_application(&p, &mut cp);
+    // Enable peripheral clocks
+    enable_peripherals(&p);
+
+    // Setup GPIO pins
+    setup_gpio_pins(&p);
+
+    // Setup SysTick
+    systick::setup_systick(&mut cp.SYST);
+    let mut autoboot_timer: u32 = systick::get_tick_ms();
+
+    // Initialize peripherals
+    let mut leds: Leds<'_> = Leds::new(&p);
+    let mut uart: UartManager<'_> = UartManager::new(&p);
+    let mut xmodem: XmodemManager = XmodemManager::new(xmodem_config);
+
+    leds.init();
+    uart.init();
+    
+    // initial rx buffer cleanup
+    clear_rx_buffer(&mut uart);
+    
+    display_menu(&mut uart);
+
+    // Enable USART2 interrupt in NVIC
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
+    }
+
+    let mut boot_option: BootOption = BootOption::None;
+    let mut update_in_progress: bool = false;
+    let mut firmware_target: u32 = APP_ADDR;
+    let mut led_toggle_time: u32 = systick::get_tick_ms();
+    let mut post_xmodem_state: PostXmodemState = PostXmodemState::Complete;
+    let mut xmodem_error_occurred: bool = false;
+
+    loop {
+        // Process UART data
+        uart.process();
+
+        // blink green
+        let current_time: u32 = systick::get_tick_ms();
+        if current_time.wrapping_sub(led_toggle_time) >= 500 {
+            leds.toggle(0);
+            led_toggle_time = current_time;
+        }
+        
+        // post-update recovery
+        if post_xmodem_state == PostXmodemState::Recovering {
+            autoboot_timer = recover_from_xmodem(&mut uart, &mut leds, true);
+            post_xmodem_state = PostXmodemState::Complete;
+            update_in_progress = false;
+            boot_option = BootOption::None;
+            continue;
         }
 
-        // check timeout
-        let current_ms: u32 = TICK_MS.load(Ordering::Relaxed);
-        let start_ms: u32 = START_TIME.get(|time: &mut u32| *time);
-        if (current_ms - start_ms) >= BOOT_TIMEOUT_MS {
-            queue_string("\r\nTimeout reached. Booting application...\r\n");
-            
-            // wait to finish
-            while TX_IN_PROGRESS.load(Ordering::SeqCst) {
-                ensure_transmitting();
+        // read keys if not in update mode
+        if !update_in_progress {
+            if let Some(byte) = uart.read_byte() {
+                // if user presses anything reset the autoboot
+                autoboot_timer = current_time;
+                
+                match byte {
+                    b'U' | b'u' => {
+                        // updater
+                        if bootloader::is_firmware_valid(UPDATER_ADDR, &boot_config) {
+                            uart.send_string("\r\n Booting updater...\r\n");
+                            boot_option = BootOption::Updater;
+                        } else {
+                            uart.send_string("\r\nValid updater not found!\r\n");
+                            systick::wait_ms(systick::get_tick_ms(), 1500);
+                            display_menu(&mut uart);
+                        }
+                    },
+                    b'F' | b'f' => {
+                        // start update
+                        clear_screen(&mut uart);
+                        uart.send_string("\r\nUpdate firmware using XMODEM - select target:\r\n");
+                        uart.send_string("'1' - Updater\r\n");
+                        uart.send_string("'2' - Application\r\n");
+                        boot_option = BootOption::SelectUpdateTarget;
+                    },
+                    b'1' => {
+                        if boot_option == BootOption::SelectUpdateTarget {
+                            // start updater update
+                            clear_screen(&mut uart);
+                            uart.send_string("Updating updater...\r\n");
+                            uart.send_string("Send file using XMODEM protocol with CRC-16. \r\nIf menu doesn't load after update is over, please press 'Esc'\r\n");
+                            firmware_target = UPDATER_ADDR;
+                            xmodem.start(firmware_target);
+                            update_in_progress = true;
+                            boot_option = BootOption::None;
+                            
+                            leds.set(0, true);  // Green - system alive
+                            leds.set(1, true);  // Orange - XMODEM active
+                            leds.set(2, false); // Red - no error
+                            leds.set(3, false); // Blue - no data received yet
+                            
+                            // send 'C'
+                            if let Some(response) = xmodem.get_response() {
+                                uart.send_byte(response);
+                            }
+                        } else {
+                            // invalid option in main menu
+                            display_menu(&mut uart);
+                        }
+                    },
+                    b'2' => {
+                        if boot_option == BootOption::SelectUpdateTarget {
+                            // start application update
+                            clear_screen(&mut uart);
+                            uart.send_string("Updating application...\r\n");
+                            uart.send_string("Send file using XMODEM protocol with CRC-16.\r\nIf menu doesn't load after update is over, please press 'Esc'\r\n");
+                            firmware_target = APP_ADDR;
+                            xmodem.start(firmware_target);
+                            update_in_progress = true;
+                            boot_option = BootOption::None;
+
+                            leds.set(0, true);  // Green - system alive
+                            leds.set(1, true);  // Orange - XMODEM active
+                            leds.set(2, false); // Red - no error
+                            leds.set(3, false); // Blue - no data received yet
+                            
+                            // send 'C'
+                            if let Some(response) = xmodem.get_response() {
+                                uart.send_byte(response);
+                            }
+                        } else {
+                            // invalid option in main menu
+                            display_menu(&mut uart);
+                        }
+                    },
+
+                    b'I' | b'i' => {
+                        // diagnostic info
+                        clear_screen(&mut uart);
+                        uart.send_string("\r\n--- System Information ---\r\n\r\n");
+                        
+                        // loader
+                        uart.send_string("Loader (this image) : ");
+
+                        if let Some(header) = bootloader::get_firmware_header(LOADER_ADDR, &boot_config) {
+                            uart.send_string("Valid\r\n");
+                            
+                            uart.send_string("  Version: ");
+                            uart.send_string(itoa(header.version_major as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_minor as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_patch as u32));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Vector table: 0x");
+                            uart.send_string(to_hex(header.vector_addr));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Data size: ");
+                            uart.send_string(itoa(header.data_size));
+                            uart.send_string(" bytes\r\n");
+                            
+                            uart.send_string("  CRC: 0x");
+                            uart.send_string(to_hex(header.crc));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Address: 0x");
+                            uart.send_string(to_hex(LOADER_ADDR));
+                            uart.send_string("\r\n");
+                        } else {
+                            uart.send_string("Invalid or Not Found\r\n");
+                        }
+                        
+                        uart.send_string("\r\n");
+                        
+                        // app
+                        uart.send_string("Application: ");
+                        if let Some(header) = bootloader::get_firmware_header(APP_ADDR, &boot_config) {
+                            uart.send_string("Valid\r\n");
+                            
+                            uart.send_string("  Version: ");
+                            uart.send_string(itoa(header.version_major as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_minor as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_patch as u32));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Vector table: 0x");
+                            uart.send_string(to_hex(header.vector_addr));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Data size: ");
+                            uart.send_string(itoa(header.data_size));
+                            uart.send_string(" bytes\r\n");
+                            
+                            uart.send_string("  CRC: 0x");
+                            uart.send_string(to_hex(header.crc));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Address: 0x");
+                            uart.send_string(to_hex(APP_ADDR));
+                            uart.send_string("\r\n");
+                        } else {
+                            uart.send_string("Invalid or Not Found\r\n");
+                        }
+                        
+                        uart.send_string("\r\n");
+                        
+                        // updater
+                        uart.send_string("Updater: ");
+                        if let Some(header) = bootloader::get_firmware_header(UPDATER_ADDR, &boot_config) {
+                            uart.send_string("Valid\r\n");
+                            
+                            uart.send_string("  Version: ");
+                            uart.send_string(itoa(header.version_major as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_minor as u32));
+                            uart.send_string(".");
+                            uart.send_string(itoa(header.version_patch as u32));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Vector table: 0x");
+                            uart.send_string(to_hex(header.vector_addr));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Data size: ");
+                            uart.send_string(itoa(header.data_size));
+                            uart.send_string(" bytes\r\n");
+                            
+                            uart.send_string("  CRC: 0x");
+                            uart.send_string(to_hex(header.crc));
+                            uart.send_string("\r\n");
+                            
+                            uart.send_string("  Address: 0x");
+                            uart.send_string(to_hex(UPDATER_ADDR));
+                            uart.send_string("\r\n");
+                        } else {
+                            uart.send_string("Invalid or Not Found\r\n");
+                        }
+                        
+                        uart.send_string("\r\n");
+                        uart.send_string("System Info:\r\n");
+                        uart.send_string("  Boot timeout: ");
+                        uart.send_string(itoa(BOOT_TIMEOUT_MS / 1000));
+                        uart.send_string(" seconds\r\n");
+                        uart.send_string("  System uptime: ");
+                        uart.send_string(itoa(systick::get_tick_ms() / 1000));
+                        uart.send_string(" seconds\r\n");
+                        
+                        uart.send_string("\r\nPress 'Escape' to return to menu...\r\n");
+                        
+                        loop {
+                            uart.process();
+                            if let Some(key) = uart.read_byte() {
+                                if key == b'\x1B' {
+                                    autoboot_timer = systick::get_tick_ms();
+                                    break;
+                                }
+                                autoboot_timer = systick::get_tick_ms();
+                            }
+                        }
+                        
+                        display_menu(&mut uart);
+                    },
+                    b'\r' | b'\n' => {
+                        if is_enter_blocked(current_time) {
+                            // ignore Enter after update because of ExtraPuTTY sending '\r'
+                        } else {
+                            if check_application_valid(&mut uart, &boot_config) {
+                                uart.send_string("\r\n Booting application...\r\n");
+                                boot_option = BootOption::Application;
+                            } else {
+                                uart.send_string("\r\nValid application not found!\r\n");
+                                systick::wait_ms(systick::get_tick_ms(), 1500);
+                                display_menu(&mut uart);
+                            }
+                        }
+                    },
+                    _ => {
+                        if byte != 0 {
+                            if boot_option == BootOption::SelectUpdateTarget {
+                                boot_option = BootOption::None;
+                            } 
+                            if byte == b'\x1B' {
+                                clear_screen(&mut uart);
+                                display_menu(&mut uart);
+                            } else {
+                                // invalid option
+                            }
+                        }
+                    },
+                }
+            }
+        } else {
+            // handle XMODEM update
+            if let Some(byte) = uart.read_byte() {
+                
+                match xmodem.process_byte(byte) {
+                    Ok(true) => {
+                        // response required
+                        if let Some(response) = xmodem.get_response() {
+                            uart.send_byte(response);
+                        }
+                    },
+                    Ok(false) => {
+                        // no response needed
+                    },
+                    Err(XmodemError::TransferComplete) => {
+                        // send ACK for EOT
+                        if let Some(response) = xmodem.get_response() {
+                            uart.send_byte(response);
+                        }
+                    
+                        update_in_progress = false;
+                        xmodem_error_occurred = false;
+
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    },
+                    Err(XmodemError::Cancelled) => {
+                        // abortion
+                        uart.send_string("\r\nTransfer cancelled.\r\n");
+                        
+                        while !uart.is_tx_complete() {
+                            uart.process();
+                        }
+                        
+                        xmodem_error_occurred = true;
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    },
+                    Err(XmodemError::Timeout) => {
+                        // timeout
+                        uart.send_string("\r\nTransfer timed out.\r\n");
+                        
+                        while !uart.is_tx_complete() {
+                            uart.process();
+                        }
+                        
+                        xmodem_error_occurred = true;
+                        leds.set(2, true);
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    },
+                    Err(XmodemError::SequenceError) | Err(XmodemError::CrcError) => {
+                        // XMODEM will handle retries, we just send responses
+                        if let Some(response) = xmodem.get_response() {
+                            uart.send_byte(response);
+                        }
+                    },
+                    Err(XmodemError::InvalidPacket) => {
+                        // XMODEM will handle retries, we just send responses
+                        if let Some(response) = xmodem.get_response() {
+                            uart.send_byte(response);
+                        }
+                    },
+                    Err(XmodemError::FlashWriteError) => {
+                        xmodem.cancel_transfer();
+                        send_cancel_sequence(&mut uart);
+
+                        // flash error processing
+                        uart.send_string("\r\nError writing to flash memory.\r\n");
+                        
+                        while !uart.is_tx_complete() {
+                            uart.process();
+                        }
+                        
+                        xmodem_error_occurred = true;
+                        leds.set(2, true);
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    },
+                    Err(XmodemError::InvalidMagic) => {
+                        xmodem.cancel_transfer();
+                        send_cancel_sequence(&mut uart);
+                        
+                        // invalid magic
+                        uart.send_string("\r\nInvalid firmware image magic number.\r\n");
+                        
+                        while !uart.is_tx_complete() {
+                            uart.process();
+                        }
+                        
+                        xmodem_error_occurred = true;
+                        leds.set(2, true);
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    },
+                    Err(XmodemError::OlderVersion) => {
+                        xmodem.cancel_transfer();
+                        send_cancel_sequence(&mut uart);
+                        
+                        xmodem_error_occurred = true;
+                        post_xmodem_state = PostXmodemState::Recovering;
+                    }
+                }
             }
             
-            boot_application(&p, &mut cp);
+            // check if need to send 'C'
+            if xmodem.should_send_byte() {
+                if let Some(response) = xmodem.get_response() {
+                    uart.send_byte(response);
+                }
+            }
+            
+            // check for errors
+            if xmodem.get_state() == XmodemState::Error {
+                // general error processing
+                uart.send_string("\r\nXMODEM transfer error. Aborting.\r\n");
+                
+                while !uart.is_tx_complete() {
+                    uart.process();
+                }
+                
+                xmodem_error_occurred = true;
+
+                post_xmodem_state = PostXmodemState::Recovering;
+            }
         }
 
-        ensure_transmitting();
+        // Handle boot options
+        match boot_option {
+            BootOption::Application => {
+                if check_application_valid(&mut uart, &boot_config) {
+                    // wait for UART to finish sending
+                    while !uart.is_tx_complete() {
+                        uart.process();
+                    }
+                    clear_rx_buffer(&mut uart);
+                    bootloader::boot_application(&p, &mut cp, &boot_config);
+                } else {
+                    clear_screen(&mut uart);
+                    uart.send_string("\r\nApplication validation failed just before boot\r\n");
+                    boot_option = BootOption::None;
+                    systick::wait_ms(systick::get_tick_ms(), 1500);
+                    display_menu(&mut uart);
+                }
+            },
+            BootOption::Updater => {
+                // wait for UART to finish sending
+                while !uart.is_tx_complete() {
+                    uart.process();
+                }
+                clear_rx_buffer(&mut uart);
+                
+                bootloader::boot_updater(&p, &mut cp, &boot_config);
+            },
+            _ => {}
+        }
 
-        asm::wfi();
+        // check for boot timeout
+        if !update_in_progress && boot_option == BootOption::None && 
+           !is_enter_blocked(current_time) && post_xmodem_state == PostXmodemState::Complete {
+            let current_time: u32 = systick::get_tick_ms();
+            
+            if current_time.wrapping_sub(autoboot_timer) >= BOOT_TIMEOUT_MS {
+                if check_application_valid(&mut uart, &boot_config) {
+                    uart.send_string("\r\n Auto-boot timeout reached. Booting application...\r\n");
+                    
+                    for _ in 0..5 {
+                        uart.process();
+                    }
+                    
+                    while !uart.is_tx_complete() {
+                        uart.process();
+                    }
+                    clear_rx_buffer(&mut uart);
+                    
+                    boot_option = BootOption::Application;
+                } else {
+                    uart.send_string("\r\n Auto-boot timeout reached but valid application not found!\r\n");
+                    
+                    for _ in 0..5 {
+                        uart.process();
+                    }
+                    
+                    // reset autoboot timer
+                    autoboot_timer = current_time;
+                    systick::wait_ms(systick::get_tick_ms(), 1500);
+                    display_menu(&mut uart);
+                }
+            }
+        }
     }
 }
 
-fn setup_system_clock(p: &Peripherals) {
-    // PWR clock
+fn clear_rx_buffer(uart: &mut UartManager) {
+    while uart.read_byte().is_some() {}
+}
+
+fn itoa(mut value: u32) -> &'static str {
+    static mut BUFFER: [u8; 16] = [0; 16];
+    
+    if value == 0 {
+        return "0";
+    }
+    
+    let mut i: usize = 0;
+    unsafe {
+        while value > 0 && i < BUFFER.len() {
+            BUFFER[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+            i += 1;
+        }
+        
+        // Reverse the digits
+        let mut j: usize = 0;
+        let mut k: usize = i - 1;
+        while j < k {
+            let temp: u8 = BUFFER[j];
+            BUFFER[j] = BUFFER[k];
+            BUFFER[k] = temp;
+            j += 1;
+            k -= 1;
+        }
+        
+        BUFFER[i] = 0;
+        
+        // convert to string slice
+        core::str::from_utf8_unchecked(&BUFFER[0..i])
+    }
+}
+
+fn to_hex(mut value: u32) -> &'static str {
+    static mut BUFFER: [u8; 16] = [0; 16];
+    
+    if value == 0 {
+        return "0";
+    }
+    
+    let mut i: usize = 0;
+    unsafe {
+        while value > 0 && i < BUFFER.len() {
+            let digit: u32 = value % 16;
+            BUFFER[i] = if digit < 10 {
+                b'0' + digit as u8
+            } else {
+                b'a' + (digit - 10) as u8
+            };
+            value /= 16;
+            i += 1;
+        }
+        
+        // Reverse the digits
+        let mut j: usize = 0;
+        let mut k: usize = i - 1;
+        while j < k {
+            let temp: u8 = BUFFER[j];
+            BUFFER[j] = BUFFER[k];
+            BUFFER[k] = temp;
+            j += 1;
+            k -= 1;
+        }
+        
+        BUFFER[i] = 0;
+        
+        // Convert to string slice
+        core::str::from_utf8_unchecked(&BUFFER[0..i])
+    }
+}
+
+fn enable_peripherals(p: &Peripherals) {
+    // Enable GPIO clocks
+    p.rcc.ahb1enr().modify(|_, w| {
+        w.gpioaen().enabled()
+         .gpioden().enabled()
+    });
+    
+    // Enable USART2 clock
+    p.rcc.apb1enr().modify(|_, w| {
+        w.usart2en().enabled()
+    });
+    
+    // Enable SYSCFG clock
+    p.rcc.apb2enr().modify(|_, w| {
+        w.syscfgen().enabled()
+    });
+}
+
+fn setup_gpio_pins(p: &Peripherals) {
+    // PA2 = TX, PA3 = RX
+    p.gpioa.moder().modify(|_, w| {
+        w.moder2().alternate()
+         .moder3().alternate()
+    });
+
+    p.gpioa.afrl().modify(|_, w| {
+        w.afrl2().af7()
+         .afrl3().af7()
+    });
+    
+    p.gpioa.ospeedr().modify(|_, w| {
+        w.ospeedr2().high_speed()
+         .ospeedr3().high_speed()
+    });
+    
+    p.gpioa.pupdr().modify(|_, w| {
+        w.pupdr2().floating()
+         .pupdr3().floating()
+    });
+}
+
+fn setup_system_clock(p: &pac::Peripherals) {
+    // Enable PWR clock
     p.rcc.apb1enr().modify(|_, w| w.pwren().set_bit());
 
-    // Scale 1
+    // Set voltage scale
     p.pwr.cr().modify(|_, w| w.vos().scale1());
 
-    // flash latency
+    // Configure flash latency
     p.flash.acr().modify(|_, w| w
         .latency().ws5()
         .prften().set_bit()
@@ -164,490 +829,41 @@ fn setup_system_clock(p: &Peripherals) {
     // Enable HSE
     p.rcc.cr().modify(|_, w| w.hseon().set_bit());
     while p.rcc.cr().read().hserdy().bit_is_clear() {
-        // wait
+        // wait for HSE ready
     }
 
-    // PLL configuration
+    // 90 Mhz
     p.rcc.pllcfgr().modify(|_, w| unsafe {
         w.pllsrc().hse()
-        .pllm().bits(4)
-        .plln().bits(90)
-        .pllp().div2()
-        .pllq().bits(4)
+         .pllm().bits(4)
+         .plln().bits(90)
+         .pllp().div2()
+         .pllq().bits(4)
     });
 
     // Enable PLL
     p.rcc.cr().modify(|_, w| w.pllon().set_bit());
     while p.rcc.cr().read().pllrdy().bit_is_clear() {
-        // wait
+        // wait for PLL ready
     }
 
-    // bus dividers
-    p.rcc.cfgr().modify(|_, w| {
-        w.hpre().div1()
+    // Configure bus clocks
+    p.rcc.cfgr().modify(|_, w| w
+        .hpre().div1()
         .ppre1().div4()
         .ppre2().div2()
-    });
+    );
 
-    // PLL as sys clock
+    // PLL as system clock
     p.rcc.cfgr().modify(|_, w| w.sw().pll());
     while !p.rcc.cfgr().read().sws().is_pll() {
-        // wait
+        // wait for PLL to be the system clock source
     }
-}
-
-fn setup_systick(syst: &mut SYST) {
-    syst.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
-    syst.set_reload(90_000  - 1);
-    syst.clear_current();
-    syst.enable_counter();
-    syst.enable_interrupt();
-}
-
-fn setup_gpio(p: &Peripherals) {
-    p.rcc.ahb1enr().modify(|_, w| {
-        w.gpioaen().enabled()
-        .gpioden().enabled()
-    });
-
-    p.gpioa.moder().modify(|_, w| {
-        w.moder2().alternate()
-        .moder3().alternate()
-    });
-
-    p.gpioa.ospeedr().modify(|_, w| {
-        w.ospeedr2().high_speed()
-         .ospeedr3().high_speed()
-    });
-    
-    p.gpioa.afrl().modify(|_, w| {
-        w.afrl2().af7()
-         .afrl3().af7()
-    });
-
-    p.gpiod.moder().modify(|_, w| {
-        w.moder12().output()
-         .moder13().output()
-         .moder14().output()
-         .moder15().output()
-    });
-    
-    p.gpiod.otyper().modify(|_, w| {
-        w.ot12().push_pull()
-         .ot13().push_pull()
-         .ot14().push_pull()
-         .ot15().push_pull()
-    });
-    
-    p.gpiod.ospeedr().modify(|_, w| {
-        w.ospeedr12().low_speed()
-         .ospeedr13().low_speed()
-         .ospeedr14().low_speed()
-         .ospeedr15().low_speed()
-    });
-}
-
-fn setup_usart(p: &Peripherals) {
-    // Enable USART2 clock
-    p.rcc.apb1enr().modify(|_, w| w.usart2en().set_bit());
-
-    p.usart2.brr().write(|w| unsafe {
-        w.div_mantissa().bits(0xc)
-        .div_fraction().bits(0x3)
-    });
-
-    // enable error interrupts
-    p.usart2.cr1().write(|w| {
-        w.ue().enabled()
-        .te().enabled()
-        .re().enabled()
-    });
-}
-
-fn send_welcome_message_polling(p: &Peripherals) {
-    let message: &str = "\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r
-xxxxxxxx  xxxxxxxxxxxxxxxxxxxx  xxxxxxxxx\r
-xxxxxxxxxx  xxxxxxxxxxxxxxxxx  xxxxxxxxxx\r
-xxxxxx  xxx  xxxxxxxxxxxxxxx  xx   xxxxxx\r
-xxxxxxxx  xx  xxxxxxxxxxxxx  xx  xxxxxxxx\r
-xxxx  xxx   xxxxxxxxxxxxxxxxx  xxx  xxxxx\r
-xxxxxx    xxxx  xxxxxxxx  xxx     xxxxxxx\r
-xxxxxxxx xxxxx xx      xx xxxx  xxxxxxxxx\r
-xxxx     xxxxx   xx  xx   xxxxx     xxxxx\r
-xxxxxxxx xxxxxxxxxx  xxxxxxxxxx  xxxxxxxx\r
-xxxxx    xxxxxx  xx  xx  xxxxxx    xxxxxx\r
-xxxxxxxx  xxxx xxxx  xxxx xxxxx xxxxxxxxx\r
-xxxxxxx    xxx  xxx  xxx  xxx    xxxxxxxx\r
-xxxxxxxxxx   xxxxxx  xxxxxx   xxxxxxxxxxx\r
-xxxxxxxxxxxxxx             xxxxxxxxxxxxxx\r
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r
-                   \r\n\r\nPress 'U' to enter updater\r\n\
-                   Press 'Enter' to boot application\r\n\
-                   Will boot automatically in 10 seconds...\r\n";
-    
-    for byte in message.bytes() {
-        while p.usart2.sr().read().txe().bit_is_clear() {
-            // wait TX empty
-        }
-        
-        // send byte
-        p.usart2.dr().write(|w| unsafe { w.bits(byte as u16) });
-    }
-    
-    while p.usart2.sr().read().tc().bit_is_clear() {
-        // wait TC
-    }
-}
-
-fn ensure_transmitting() {
-    if !TX_IN_PROGRESS.load(Ordering::SeqCst) {
-        // Check if there is any data that can be transferred
-        if let Some(byte) = TX_BUFFER.get(|buf| buf.read()) {
-            USART2_PTR.get(|usart_opt| {
-                if let Some(ref usart_ptr) = *usart_opt {
-                    unsafe {
-                        // get USART2
-                        let usart2: &stm32f4::usart1::RegisterBlock = &*(usart_ptr.0 as *const pac::usart1::RegisterBlock);
-                        
-                        // Write to DR will fix TXE
-                        usart2.dr().write(|w| w.bits(byte as u16));
-                        
-                        // Enable TXE interrupt
-                        usart2.cr1().modify(|_, w| w.txeie().enabled());
-                        
-                        TX_IN_PROGRESS.store(true, Ordering::SeqCst);
-                    }
-                }
-            });
-        }
-    }
-}
-
-fn queue_string(s: &str) {
-    TX_BUFFER.get(|buf: &mut RingBuffer| {
-        for byte in s.bytes() {
-            buf.write(byte);
-        }
-    });
-    
-    ensure_transmitting();
-}
-
-fn boot_application(p: &pac::Peripherals, cp: &mut cortex_m::Peripherals) -> ! {
-    let is_app_valid: bool = unsafe {
-        *(SLOT_2_VER_ADDR as *const u32) != 0xFFFFFFFF
-    };
-
-    if !is_app_valid {
-        queue_string("\r\nValid application not found!\r\n");
-        
-        while TX_IN_PROGRESS.load(Ordering::SeqCst) {
-            ensure_transmitting();
-        }
-        
-        loop {
-            asm::nop();
-        }
-    }
-
-    let reset_addr: u32 = SLOT_2_APP_ADDR + 4;
-    let stack_addr: u32 = unsafe {
-        *(SLOT_2_APP_ADDR as *const u32)
-    };
-    let reset_vector: u32 = unsafe {
-        *(reset_addr as *const u32)
-    };
-
-    // Reset clock
-    p.rcc.cr().modify(|_, w| w.hsion().set_bit());
-    while p.rcc.cr().read().hsirdy().bit_is_clear() {
-        // wait
-    }
-
-    // Set HSITRIM[4:0] bits to the reset value
-    p.rcc.cr().modify(|_, w| unsafe {
-        w.hsitrim().bits(0x10)
-    });
-
-    p.rcc.cfgr().reset();
-    while !p.rcc.cfgr().read().sws().is_hsi() {
-        // wait
-    }
-
-    p.rcc.cr().modify(|_, w| w
-        .hseon().clear_bit()
-        .hsebyp().clear_bit()
-        .csson().clear_bit()
-    );
-    while p.rcc.cr().read().hserdy().bit_is_set() {
-        // wait
-    }
-
-    //reset PLL
-    p.rcc.cr().modify(|_, w| w.pllon().clear_bit());
-    while p.rcc.cr().read().pllrdy().bit_is_set() {
-        // wait
-    }
-
-    // reset PLL configuration
-    p.rcc.pllcfgr().modify(|_, w| unsafe {
-        w.pllm().bits(0x10)
-        .plln().bits(0x040)
-        .pllp().bits(0x080)
-        .pllq().bits(0x4)
-    });
-
-    // disable all interrupts
-    p.rcc.cir().modify(|_, w| w
-        .lsirdyie().clear_bit()
-        .lserdyie().clear_bit()
-        .hsirdyie().clear_bit()
-        .pllrdyie().clear_bit()
-    );
-    p.rcc.cir().modify(|_, w| w
-        .lsirdyc().clear_bit()
-        .lserdyc().clear_bit()
-        .hsirdyc().clear_bit()
-        .pllrdyc().clear_bit()
-    );
-
-    // reset all CSR flags
-    p.rcc.csr().modify(|_, w| w.rmvf().set_bit());
-
-    // force reset for all peripherals
-    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0xF6FEC9FF) });
-    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x04777933) });
-    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x226011FF) });
-    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x000000C1) });
-    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x00000001) });
-    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x0) });
-
-    // remap
-    p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
-    p.syscfg.memrmp().write(|w| unsafe {
-        w.bits(0x01)
-    });
-
-    // disable SysTick
-    let mut cp: cortex_m::Peripherals = unsafe {
-        cortex_m::Peripherals::steal()
-    };
-    cp.SYST.disable_counter();
-    cp.SYST.disable_interrupt();
-
-    unsafe {
-        let scb: *const peripheral::scb::RegisterBlock = SCB::ptr();
-
-        let icsr: u32 = (*scb).icsr.read();
-        (*scb).icsr.write(icsr | (1 << 25));
-
-        (*scb).shcsr.modify(|v: u32| v & !(
-            (1 << 18) | (1 << 17) | (1 << 16)
-        ));
-
-        (*scb).vtor.write(SLOT_2_APP_ADDR);
-
-        // change SP
-        core::arch::asm!("MSR msp, {0}", in(reg) stack_addr);
-
-        let jump_fn: extern "C" fn() -> ! = core::mem::transmute(reset_vector);
-        jump_fn();
-    }
-}
-
-fn boot_updater(p: &pac::Peripherals, cp: &mut cortex_m::Peripherals) -> ! {
-
-    let reset_addr: u32 = UPDATER_ADDR + 4;
-    let stack_addr: u32 = unsafe {
-        *(UPDATER_ADDR as *const u32)
-    };
-    let reset_vector: u32 = unsafe {
-        *(reset_addr as *const u32)
-    };
-
-    p.rcc.cr().modify(|_, w| w.hsion().set_bit());
-    while p.rcc.cr().read().hsirdy().bit_is_clear() {
-        // wait
-    }
-
-    // set hsitrim to reset value
-    p.rcc.cr().modify(|_, w| unsafe {
-        w.hsitrim().bits(0x10)
-    });
-
-    p.rcc.cfgr().reset();
-    while !p.rcc.cfgr().read().sws().is_hsi() {
-        asm::nop();
-    }
-
-    p.rcc.cr().modify(|_, w| w
-        .hseon().clear_bit()
-        .hsebyp().clear_bit()
-        .csson().clear_bit()
-    );
-    while p.rcc.cr().read().hserdy().bit_is_set() {
-        asm::nop();
-    }
-
-    // reset PLL configuration
-    p.rcc.pllcfgr().modify(|_, w| unsafe {
-        w.pllm().bits(0x10)
-        .plln().bits(0x040)
-        .pllp().bits(0x080)
-        .pllq().bits(0x4)
-    });
-
-    // disable all interrupts
-    p.rcc.cir().modify(|_, w| w
-        .lsirdyie().clear_bit()
-        .lserdyie().clear_bit()
-        .hsirdyie().clear_bit()
-        .pllrdyie().clear_bit()
-    );
-    p.rcc.cir().modify(|_, w| w
-        .lsirdyc().clear_bit()
-        .lserdyc().clear_bit()
-        .hsirdyc().clear_bit()
-        .pllrdyc().clear_bit()
-    );
-
-    // reset all CSR flags
-    p.rcc.csr().modify(|_, w| w.rmvf().set_bit());
-
-    // force reset for all peripherals
-    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0xF6FEC9FF) });
-    p.rcc.apb1rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x04777933) });
-    p.rcc.apb2rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x226011FF) });
-    p.rcc.ahb1rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x000000C1) });
-    p.rcc.ahb2rstr().write(|w| unsafe { w.bits(0x0) });
-
-    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x00000001) });
-    p.rcc.ahb3rstr().write(|w| unsafe { w.bits(0x0) });
-
-    // remap
-    p.rcc.apb2enr().modify(|_, w| w.syscfgen().set_bit());
-    p.syscfg.memrmp().write(|w| unsafe {
-        w.bits(0x01)
-    });
-
-    // disable SysTick
-    let mut cp: cortex_m::Peripherals = unsafe {
-        cortex_m::Peripherals::steal()
-    };
-    cp.SYST.disable_counter();
-    cp.SYST.disable_interrupt();
-
-    // disable all pending interrupts
-    unsafe {
-        let scb: *const peripheral::scb::RegisterBlock = SCB::ptr();
-
-        let icsr: u32 = (*scb).icsr.read();
-        (*scb).icsr.write(icsr | (1 << 25));
-
-        (*scb).shcsr.modify(|v: u32| v & !(
-            (1 << 18) | (1 << 17) | (1 << 16)
-        ));
-
-        (*scb).vtor.write(UPDATER_ADDR);
-
-        // change SP
-        core::arch::asm!("MSR msp, {0}", in(reg) stack_addr);
-
-        let jump_fn: extern "C" fn() -> ! = core::mem::transmute(reset_vector);
-        jump_fn();
-    }
-}
-
-fn process_input() {
-    if let Some(byte) = RX_BUFFER.get(|buf: &mut RingBuffer| buf.read()) {
-        match byte {
-            b'U' | b'u' => {
-                queue_string("\r\nBooting to updater...\r\n");
-                LOAD_APPLICATION.store(false, Ordering::SeqCst);
-
-                while TX_IN_PROGRESS.load(Ordering::SeqCst) {
-                    ensure_transmitting();
-                }
-
-                let p: Peripherals = unsafe {pac::Peripherals::steal()};
-                let mut cp: cortex_m::Peripherals = unsafe {cortex_m::Peripherals::steal()};
-                boot_updater(&p, &mut cp)
-            },
-
-            b'\r' | b'\n' => {
-
-                let is_app_valid: bool = unsafe { *(SLOT_2_VER_ADDR as *const u32) != 0xFFFFFFFF };
-                
-                if !is_app_valid {
-                    queue_string("\r\nValid application not found!\r\n");
-                } else {
-                    queue_string("\r\nBooting application...\r\n");
-                    LOAD_APPLICATION.store(true, Ordering::SeqCst);
-                    
-                    while TX_IN_PROGRESS.load(Ordering::SeqCst) {
-                        ensure_transmitting();
-                    }
-                }
-            },
-
-            _ => {
-                queue_string("\r\nPress 'U' for updater, 'Enter' for application\r\n");
-            },
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn USART2() {
-    USART2_PTR.get(|usart_opt: &mut Option<PeripheralPtr<stm32f4::usart1::RegisterBlock>>| {
-        if let Some(ref usart_ptr) = *usart_opt {
-            unsafe {
-                let usart2 = &*(usart_ptr.0 as *const pac::usart2::RegisterBlock);
-
-                // check data in RX buffer
-                if usart2.sr().read().rxne().bit_is_set() {
-                    let data = usart2.dr().read().bits() as u8;
-                    RX_BUFFER.get(|buf: &mut RingBuffer| {buf.write(data);
-                    });
-                }
-
-                // check if we can TX
-                if usart2.sr().read().txe().bit_is_set() && usart2.cr1().read().txeie().bit_is_set() {
-                    TX_IN_PROGRESS.store(false, Ordering::SeqCst);
-
-                    if let Some(byte) = TX_BUFFER.get(|buf| buf.read()) {
-                        usart2.dr().write(|w| unsafe {
-                            w.bits(byte as u16)
-                        });
-                        TX_IN_PROGRESS.store(true, Ordering::SeqCst);
-                    } else {
-                        // disable TXE because no data left
-                        usart2.cr1().modify(|_, w| w.txeie().disabled());
-                    }
-                }
-            }
-        }
-    })
 }
 
 #[exception]
 fn SysTick() {
-    let current: u32 = TICK_MS.load(Ordering::Relaxed);
-    TICK_MS.store(current + 1, Ordering::Relaxed);
+    systick::increment_tick();
 }
 
 #[panic_handler]
