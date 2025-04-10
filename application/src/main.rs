@@ -5,10 +5,34 @@ use core::panic::PanicInfo;
 use cortex_m::asm;
 use cortex_m_rt::entry;
 use stm32f4 as pac;
+use misc::image::{ImageHeader, SharedMemory, IMAGE_MAGIC_APP, IMAGE_TYPE_APP};
 
+// symbol from linker
+extern "C" {
+    static __firmware_size: u32;
+}
+
+#[no_mangle]
+#[link_section = ".image_hdr"]
+pub static mut IMAGE_HEADER: ImageHeader = ImageHeader::new(
+    IMAGE_TYPE_APP,
+    IMAGE_MAGIC_APP,
+    1, 0, 0
+);
 
 #[entry]
 fn main() -> ! {
+    // get size from linker
+    let firmware_size: u32 = unsafe {
+        let size: *const u32 = &__firmware_size as *const u32;
+        let size_value: u32 = *size;
+        
+        // update size data in header
+        IMAGE_HEADER.update_data_size(size_value);
+        
+        size_value
+    };
+
     // PD12 init 
     let peripherals: stm32f4::Peripherals = unsafe { pac::Peripherals::steal() };
     
