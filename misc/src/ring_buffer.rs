@@ -2,7 +2,7 @@
 
 use core::cell::UnsafeCell;
 
-pub const RING_BUFFER_SIZE: usize = 1024;
+pub const RING_BUFFER_SIZE: usize = 2048;
 
 #[repr(C)]
 pub struct RingBuffer {
