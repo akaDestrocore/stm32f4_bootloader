@@ -1,24 +1,20 @@
 #![no_std]
 #![no_main]
 
-mod led;
-mod uart;
-
 include!(concat!(env!("OUT_DIR"), "/header_values.rs"));
 
 use misc::{
     bootloader::{self, BootOption, BootConfig},
     xmodem::{XmodemManager, XmodemConfig, XmodemError, XmodemState, CAN},
-    image::{SharedMemory, IMAGE_MAGIC_LOADER, IMAGE_TYPE_LOADER},
+    image::{SharedMemory, IMAGE_TYPE_LOADER},
     systick,
+    uart::{UartManager, UartError},
+    led::Leds,
 };
 use core::panic::PanicInfo;
 use cortex_m::{asm, peripheral::SYST};
 use cortex_m_rt::{entry, exception};
-use led::Leds;
-use stm32f4 as pac;
-use stm32f4::Peripherals;
-use uart::{UartManager, UartError};
+use stm32f4::{self as pac, Peripherals};
 
 // Flash memory addresses
 pub const UPDATER_ADDR: u32 = 0x08008000;

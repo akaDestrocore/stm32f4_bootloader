@@ -1,6 +1,8 @@
 #![no_std]
 
 // Export modules
+pub mod uart;
+pub mod led;
 pub mod ring_buffer;
 pub mod image;
 pub mod flash;

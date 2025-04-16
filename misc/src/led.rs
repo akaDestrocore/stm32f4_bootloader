@@ -1,3 +1,5 @@
+#![no_std]
+
 use stm32f4 as pac;
 
 pub struct Leds<'a> {

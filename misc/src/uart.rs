@@ -1,5 +1,7 @@
+#![no_std]
+
 use core::sync::atomic::{AtomicBool, Ordering};
-use misc::ring_buffer::RingBuffer;
+use crate::ring_buffer::RingBuffer;
 use stm32f4 as pac;
 
 static mut RX_BUFFER: RingBuffer = RingBuffer::new();
