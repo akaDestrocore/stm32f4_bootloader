@@ -37,7 +37,7 @@ graph LR
     BOOT -->|Load| LOADER
     BOOT -.->|Load| UPDATER
     LOADER -->|Load, Update| APPLICATION
-    LOADER -->|Load, Updates| UPDATER
+    LOADER -->|Load, Update| UPDATER
     UPDATER -->|Load, Update| APPLICATION
     UPDATER -->|Load, Update| LOADER
 ```
