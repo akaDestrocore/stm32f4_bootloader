@@ -1,6 +1,5 @@
 import argparse
 import os
-import binascii
 import struct
 
 HEADER_SIZE = 0x200
@@ -16,7 +15,22 @@ CRC_OFFSET = 0x10
 DATA_SIZE_OFFSET = 0x14
 
 def calculate_crc32(data):
-    return binascii.crc32(data) & 0xFFFFFFFF
+    crc = 0xFFFFFFFF
+    
+    for i in range(0, len(data), 4):
+        word = 0
+        for j in range(min(4, len(data) - i)):
+            word |= data[i + j] << (j * 8)
+
+        crc ^= word
+        for _ in range(32):
+            if crc & 0x80000000:
+                crc = (crc << 1) ^ 0x04C11DB7
+            else:
+                crc = (crc << 1)
+            crc &= 0xFFFFFFFF
+
+    return crc
 
 def update_header(binary_data, base_addr):
     header = bytearray(binary_data[:HEADER_SIZE])
@@ -28,9 +42,9 @@ def update_header(binary_data, base_addr):
     vector_addr = base_addr + HEADER_SIZE
     
     # update header fields
-    struct.pack_into('<I', header, VECTOR_ADDR_OFFSET, vector_addr)  # vector_addr (4 байта)
-    struct.pack_into('<I', header, CRC_OFFSET, firmware_crc)         # crc (4 байта)
-    struct.pack_into('<I', header, DATA_SIZE_OFFSET, firmware_size)  # data_size (4 байта)
+    struct.pack_into('<I', header, VECTOR_ADDR_OFFSET, vector_addr)  # vector_addr (4 bytes)
+    struct.pack_into('<I', header, CRC_OFFSET, firmware_crc)         # crc (4 bytes)
+    struct.pack_into('<I', header, DATA_SIZE_OFFSET, firmware_size)  # data_size (4 bytes)
     
     print(f"  - Header updated: vector_addr=0x{vector_addr:08X}, data_size={firmware_size} bytes, CRC=0x{firmware_crc:08X}")
     
