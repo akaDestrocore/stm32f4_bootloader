@@ -518,14 +518,54 @@ fn main() -> ! {
                         // no response needed
                     },
                     Err(XmodemError::TransferComplete) => {
-                        // send ACK for EOT
+                        // Send ACK for EOT
                         if let Some(response) = xmodem.get_response() {
                             uart.send_byte(response);
                         }
                     
                         update_in_progress = false;
                         xmodem_error_occurred = false;
-
+                    
+                        // add a small delay for flash
+                        let start_time: u32 = systick::get_tick_ms();
+                        while !systick::wait_ms(start_time, 100) {
+                            uart.process();
+                        }
+                        
+                        // CRC validation
+                        let peripherals: stm32f4::Peripherals = unsafe { pac::Peripherals::steal() };
+                        
+                        if !misc::crc::verify_firmware_crc(&peripherals, firmware_target, IMAGE_HDR_SIZE) {
+                            uart.send_string("\r\nCRC verification failed! Invalidating firmware.\r\n");
+                            
+                            if misc::crc::invalidate_firmware(&peripherals, firmware_target) {
+                                uart.send_string("\r\nFirmware invalidated successfully.\r\n");
+                            } else {
+                                uart.send_string("\r\nFailed to invalidate firmware!\r\n");
+                            }
+                            
+                            for _ in 0..150 {
+                                uart.process();
+                            }
+                            
+                            while !uart.is_tx_complete() {
+                                uart.process();
+                            }
+                            
+                            xmodem_error_occurred = true;
+                            leds.set(2, true);
+                        } else {
+                            uart.send_string("\r\nCRC verification successful!\r\n");
+                            
+                            for _ in 0..150 {
+                                uart.process();
+                            }
+                            
+                            while !uart.is_tx_complete() {
+                                uart.process();
+                            }
+                        }
+                    
                         post_xmodem_state = PostXmodemState::Recovering;
                     },
                     Err(XmodemError::Cancelled) => {
