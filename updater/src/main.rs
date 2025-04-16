@@ -6,7 +6,7 @@ include!(concat!(env!("OUT_DIR"), "/header_values.rs"));
 use misc::{
     bootloader::{self, BootOption, BootConfig},
     xmodem::{XmodemManager, XmodemConfig, XmodemError, XmodemState, CAN},
-    image::{SharedMemory, IMAGE_TYPE_UPDATER},
+    image::SharedMemory,
     systick,
     uart::{UartManager, UartError},
     led::Leds,
