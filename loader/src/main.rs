@@ -44,23 +44,28 @@ unsafe extern "C" {
     unsafe static __firmware_size: u32;
 }
 
-fn calculate_crc32(start_addr: u32, size: u32) -> u32 {
-    let mut crc: u32 = 0xFFFFFFFF;
-    
-    for i in 0..size {
-        let byte: u8 = unsafe { *(start_addr as *const u8).offset(i as isize) };
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    
-    !crc
-}
+const BOOT_BANNER: &str = "\r\n\
+\x1B[96mxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r
+xxxxxxxx  xxxxxxxxxxxxxxxxxxxx  xxxxxxxxx\r
+xxxxxxxxxx  xxxxxxxxxxxxxxxxx  xxxxxxxxxx\r
+xxxxxx  xxx  xxxxxxxxxxxxxxx  xx   xxxxxx\r
+xxxxxxxx  xx  xxxxxxxxxxxxx  xx  xxxxxxxx\r
+xxxx  xxx   xxxxxxxxxxxxxxxxx  xxx  xxxxx\r
+xxxxxx    xxxx  xxxxxxxx  xxx     xxxxxxx\r
+xxxxxxxx xxxxx xx      xx xxxx  xxxxxxxxx\r
+xxxx     xxxxx   xx  xx   xxxxx     xxxxx\r
+xxxxxxxx xxxxxxxxxx  xxxxxxxxxx  xxxxxxxx\r
+xxxxx    xxxxxx  xx  xx  xxxxxx    xxxxxx\r
+xxxxxxxx  xxxx xxxx  xxxx xxxxx xxxxxxxxx\r
+xxxxxxx    xxx  xxx  xxx  xxx    xxxxxxxx\r
+xxxxxxxxxx   xxxxxx  xxxxxx   xxxxxxxxxxx\r
+xxxxxxxxxxxxxx             xxxxxxxxxxxxxx\r
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x1B[0m\r\n\r\n";
+
+const BOOT_OPTIONS_STR: &str = "\x1B[96mPress \x1B[93m'Enter'\x1B[0m\x1B[96m to boot application\r
+Press \x1B[93m'I'\x1B[0m\x1B[96m to get information about system state\r
+Press \x1B[93m'F'\x1B[0m\x1B[96m to update firmware using XMODEM(CRC)\r
+Press \x1B[93m'U'\x1B[0m\x1B[96m to enter updater\x1B[0m\r\n";
 
 // ANSI escape
 fn clear_screen(uart: &mut UartManager) {
@@ -74,29 +79,20 @@ fn clear_screen(uart: &mut UartManager) {
 fn display_menu(uart: &mut UartManager) {
     clear_screen(uart);
     
-    uart.send_string("\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
-    uart.send_string("xxxxxxxx  xxxxxxxxxxxxxxxxxxxx  xxxxxxxxx\r\n");
-    uart.send_string("xxxxxxxxxx  xxxxxxxxxxxxxxxxx  xxxxxxxxxx\r\n");
-    uart.send_string("xxxxxx  xxx  xxxxxxxxxxxxxxx  xx   xxxxxx\r\n");
-    uart.send_string("xxxxxxxx  xx  xxxxxxxxxxxxx  xx  xxxxxxxx\r\n");
-    uart.send_string("xxxx  xxx   xxxxxxxxxxxxxxxxx  xxx  xxxxx\r\n");
-    uart.send_string("xxxxxx    xxxx  xxxxxxxx  xxx     xxxxxxx\r\n");
-    uart.send_string("xxxxxxxx xxxxx xx      xx xxxx  xxxxxxxxx\r\n");
-    uart.send_string("xxxx     xxxxx   xx  xx   xxxxx     xxxxx\r\n");
-    uart.send_string("xxxxxxxx xxxxxxxxxx  xxxxxxxxxx  xxxxxxxx\r\n");
-    uart.send_string("xxxxx    xxxxxx  xx  xx  xxxxxx    xxxxxx\r\n");
-    uart.send_string("xxxxxxxx  xxxx xxxx  xxxx xxxxx xxxxxxxxx\r\n");
-    uart.send_string("xxxxxxx    xxx  xxx  xxx  xxx    xxxxxxxx\r\n");
-    uart.send_string("xxxxxxxxxx   xxxxxx  xxxxxx   xxxxxxxxxxx\r\n");
-    uart.send_string("xxxxxxxxxxxxxx             xxxxxxxxxxxxxx\r\n");
-    uart.send_string("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n\r\n");
-    uart.send_string("Press 'Enter' to boot application\r\n");
-    uart.send_string("Press 'I' to get information about system state\r\n");
-    uart.send_string("Press 'F' to update firmware using XMODEM(CRC)\r\n");
-    uart.send_string("Press 'U' to enter updater\r\n");
-    uart.send_string("Will boot automatically in 10 seconds\r\n");
+    uart.send_string(BOOT_BANNER);
+
+    uart.send_string("\x1B[91m-- Loader v");
+    uart.send_string(itoa(unsafe{IMAGE_HEADER.version_major} as u32));
+    uart.send_string(".");
+    uart.send_string(itoa(unsafe{IMAGE_HEADER.version_minor} as u32));
+    uart.send_string(".");
+    uart.send_string(itoa(unsafe{IMAGE_HEADER.version_patch} as u32));
+    uart.send_string(" --\x1B[0m\r\n\r\n");
     
-    for _ in 0..10 {
+    uart.send_string(BOOT_OPTIONS_STR);
+    uart.send_string("\x1B[92mWill boot automatically in 10 seconds\x1B[0m\r\n");
+    
+    for _ in 0..150 {
         uart.process();
     }
 }
@@ -146,7 +142,7 @@ fn recover_from_xmodem(uart: &mut UartManager, leds: &mut Leds, block_enter: boo
     clear_rx_buffer(uart);
     let start_time: u32 = systick::get_tick_ms();
     systick::wait_ms(start_time, 3000);
-    for _ in 0..50 {
+    for _ in 0..150 {
         uart.process();
     }
     
@@ -154,7 +150,7 @@ fn recover_from_xmodem(uart: &mut UartManager, leds: &mut Leds, block_enter: boo
     clear_screen(uart);
     systick::wait_ms(systick::get_tick_ms(), 500);
 
-    for _ in 0..50 {
+    for _ in 0..150 {
         uart.process();
     }
     
@@ -166,7 +162,7 @@ fn recover_from_xmodem(uart: &mut UartManager, leds: &mut Leds, block_enter: boo
     
     // display main menu
     display_menu(uart);
-    for _ in 0..50 {
+    for _ in 0..150 {
         uart.process();
     }
     
@@ -277,10 +273,10 @@ fn main() -> ! {
                     b'U' | b'u' => {
                         // updater
                         if bootloader::is_firmware_valid(UPDATER_ADDR, &boot_config) {
-                            uart.send_string("\r\n Booting updater...\r\n");
+                            uart.send_string("\x1B[36m\r\n Booting updater...\x1B[0m\r\n");
                             boot_option = BootOption::Updater;
                         } else {
-                            uart.send_string("\r\nValid updater not found!\r\n");
+                            uart.send_string("\x1B[31m\r\nValid updater not found!\x1B[0m\r\n");
                             systick::wait_ms(systick::get_tick_ms(), 1500);
                             display_menu(&mut uart);
                         }
@@ -288,17 +284,18 @@ fn main() -> ! {
                     b'F' | b'f' => {
                         // start update
                         clear_screen(&mut uart);
-                        uart.send_string("\r\nUpdate firmware using XMODEM - select target:\r\n");
-                        uart.send_string("'1' - Updater\r\n");
-                        uart.send_string("'2' - Application\r\n");
+                        uart.send_string("\r\n\x1B[92mUpdate firmware using XMODEM - select target:\x1B[0m\r\n");
+                        uart.send_string("\x1B[93m[\x1B[32m1\x1B[93m] \x1B[96m- Updater\x1B[0m\r\n");
+                        uart.send_string("\x1B[93m[\x1B[32m2\x1B[93m] \x1B[96m- Application\x1B[0m\r\n");
                         boot_option = BootOption::SelectUpdateTarget;
                     },
                     b'1' => {
                         if boot_option == BootOption::SelectUpdateTarget {
                             // start updater update
                             clear_screen(&mut uart);
-                            uart.send_string("Updating updater...\r\n");
-                            uart.send_string("Send file using XMODEM protocol with CRC-16. \r\nIf menu doesn't load after update is over, please press 'Esc'\r\n");
+                            uart.send_string("\x1B[92mUpdating updater...\x1B[0m\r\n");
+                            uart.send_string("\r\n\x1B[96mSend file using XMODEM protocol with CRC-16. \x1B[0m\r\n\x1B[33mIf menu doesn't load after update is over, please press \
+\x1B[96m'Esc'\x1B[0m\r\n");
                             firmware_target = UPDATER_ADDR;
                             xmodem.start(firmware_target);
                             update_in_progress = true;
@@ -322,8 +319,9 @@ fn main() -> ! {
                         if boot_option == BootOption::SelectUpdateTarget {
                             // start application update
                             clear_screen(&mut uart);
-                            uart.send_string("Updating application...\r\n");
-                            uart.send_string("Send file using XMODEM protocol with CRC-16.\r\nIf menu doesn't load after update is over, please press 'Esc'\r\n");
+                            uart.send_string("\x1B[92mUpdating application...\x1B[0m\r\n");
+                            uart.send_string("\r\n\x1B[96mSend file using XMODEM protocol with CRC-16.\x1B[0m\r\n\x1B[33mIf menu doesn't load after update is over, please press \
+\x1B[96m'Esc'\x1B[0m\r\n");
                             firmware_target = APP_ADDR;
                             xmodem.start(firmware_target);
                             update_in_progress = true;
@@ -347,119 +345,119 @@ fn main() -> ! {
                     b'I' | b'i' => {
                         // diagnostic info
                         clear_screen(&mut uart);
-                        uart.send_string("\r\n--- System Information ---\r\n\r\n");
+                        uart.send_string("\x1B[91m\r\n--- System Information ---\x1B[0m\r\n\r\n");
                         
                         // loader
-                        uart.send_string("Loader (this image) : ");
+                        uart.send_string("\x1B[96mLoader (this image) : \x1B[0m");
 
                         if let Some(header) = bootloader::get_firmware_header(LOADER_ADDR, &boot_config) {
-                            uart.send_string("Valid\r\n");
+                            uart.send_string("\x1B[32mValid\x1B[0m\r\n");
                             
-                            uart.send_string("  Version: ");
+                            uart.send_string("\x1B[92m  Version: \x1B[93m");
                             uart.send_string(itoa(header.version_major as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_minor as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_patch as u32));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Vector table: 0x");
+                            uart.send_string("\x1B[92m  Vector table: \x1B[93m0x");
                             uart.send_string(to_hex(header.vector_addr));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Data size: ");
+                            uart.send_string("\x1B[92m  Data size: \x1B[93m");
                             uart.send_string(itoa(header.data_size));
-                            uart.send_string(" bytes\r\n");
+                            uart.send_string(" bytes\x1B[0m\r\n");
                             
-                            uart.send_string("  CRC: 0x");
+                            uart.send_string("\x1B[92m  CRC: \x1B[93m0x");
                             uart.send_string(to_hex(header.crc));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Address: 0x");
+                            uart.send_string("\x1B[92m  Address: \x1B[93m0x");
                             uart.send_string(to_hex(LOADER_ADDR));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                         } else {
-                            uart.send_string("Invalid or Not Found\r\n");
+                            uart.send_string("\x1B[31mInvalid or Not Found\x1B[0m\r\n");
                         }
                         
                         uart.send_string("\r\n");
                         
                         // app
-                        uart.send_string("Application: ");
+                        uart.send_string("\x1B[96mApplication: \x1B[0m");
                         if let Some(header) = bootloader::get_firmware_header(APP_ADDR, &boot_config) {
-                            uart.send_string("Valid\r\n");
+                            uart.send_string("\x1B[32mValid\x1B[0m\r\n");
                             
-                            uart.send_string("  Version: ");
+                            uart.send_string("\x1B[92m  Version: \x1B[93m");
                             uart.send_string(itoa(header.version_major as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_minor as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_patch as u32));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Vector table: 0x");
+                            uart.send_string("\x1B[92m  Vector table: \x1B[93m0x");
                             uart.send_string(to_hex(header.vector_addr));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Data size: ");
+                            uart.send_string("\x1B[92m  Data size: \x1B[93m");
                             uart.send_string(itoa(header.data_size));
-                            uart.send_string(" bytes\r\n");
+                            uart.send_string(" bytes\x1B[0m\r\n");
                             
-                            uart.send_string("  CRC: 0x");
+                            uart.send_string("\x1B[92m  CRC: \x1B[93m0x");
                             uart.send_string(to_hex(header.crc));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Address: 0x");
+                            uart.send_string("\x1B[92m  Address: \x1B[93m0x");
                             uart.send_string(to_hex(APP_ADDR));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                         } else {
-                            uart.send_string("Invalid or Not Found\r\n");
+                            uart.send_string("\x1B[31mInvalid or Not Found\x1B[0m\r\n");
                         }
                         
                         uart.send_string("\r\n");
                         
                         // updater
-                        uart.send_string("Updater: ");
+                        uart.send_string("\x1B[96mUpdater: \x1B[0m");
                         if let Some(header) = bootloader::get_firmware_header(UPDATER_ADDR, &boot_config) {
-                            uart.send_string("Valid\r\n");
+                            uart.send_string("\x1B[32mValid\x1B[0m\r\n");
                             
-                            uart.send_string("  Version: ");
+                            uart.send_string("\x1B[92m  Version: \x1B[93m");
                             uart.send_string(itoa(header.version_major as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_minor as u32));
                             uart.send_string(".");
                             uart.send_string(itoa(header.version_patch as u32));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Vector table: 0x");
+                            uart.send_string("\x1B[92m  Vector table: \x1B[93m0x");
                             uart.send_string(to_hex(header.vector_addr));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Data size: ");
+                            uart.send_string("\x1B[92m  Data size: \x1B[93m");
                             uart.send_string(itoa(header.data_size));
-                            uart.send_string(" bytes\r\n");
+                            uart.send_string(" bytes\x1B[0m\r\n");
                             
-                            uart.send_string("  CRC: 0x");
+                            uart.send_string("\x1B[92m  CRC: \x1B[93m0x");
                             uart.send_string(to_hex(header.crc));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                             
-                            uart.send_string("  Address: 0x");
+                            uart.send_string("\x1B[92m  Address: \x1B[93m0x");
                             uart.send_string(to_hex(UPDATER_ADDR));
-                            uart.send_string("\r\n");
+                            uart.send_string("\x1B[0m\r\n");
                         } else {
-                            uart.send_string("Invalid or Not Found\r\n");
+                            uart.send_string("\x1B[31mInvalid or Not Found\x1B[0m\r\n");
                         }
                         
                         uart.send_string("\r\n");
-                        uart.send_string("System Info:\r\n");
-                        uart.send_string("  Boot timeout: ");
+                        uart.send_string("\x1B[96mSystem Info:\x1B[0m\r\n");
+                        uart.send_string("\x1B[92m  Boot timeout: \x1B[93m");
                         uart.send_string(itoa(BOOT_TIMEOUT_MS / 1000));
                         uart.send_string(" seconds\r\n");
-                        uart.send_string("  System uptime: ");
+                        uart.send_string("\x1B[92m  System uptime: \x1B[93m");
                         uart.send_string(itoa(systick::get_tick_ms() / 1000));
-                        uart.send_string(" seconds\r\n");
+                        uart.send_string(" seconds\x1B[0m\r\n");
                         
-                        uart.send_string("\r\nPress 'Escape' to return to menu...\r\n");
+                        uart.send_string("\r\n\x1B[96mPress \x1B[93m'Esc'\x1B[0m \x1B[96mto return to menu...\x1B[0m\r\n");
                         
                         loop {
                             uart.process();
@@ -479,10 +477,10 @@ fn main() -> ! {
                             // ignore Enter after update because of ExtraPuTTY sending '\r'
                         } else {
                             if check_application_valid(&mut uart, &boot_config) {
-                                uart.send_string("\r\n Booting application...\r\n");
+                                uart.send_string("\x1B[92m\r\n Booting application...\x1B[0m\r\n");
                                 boot_option = BootOption::Application;
                             } else {
-                                uart.send_string("\r\nValid application not found!\r\n");
+                                uart.send_string("\x1B[31m\r\nValid application not found!\x1B[0m\r\n");
                                 systick::wait_ms(systick::get_tick_ms(), 1500);
                                 display_menu(&mut uart);
                             }
@@ -536,12 +534,12 @@ fn main() -> ! {
                         let peripherals: stm32f4::Peripherals = unsafe { pac::Peripherals::steal() };
                         
                         if !misc::crc::verify_firmware_crc(&peripherals, firmware_target, IMAGE_HDR_SIZE) {
-                            uart.send_string("\r\nCRC verification failed! Invalidating firmware.\r\n");
+                            uart.send_string("\r\n\x1B[31mCRC verification failed! Invalidating firmware.\x1B[0m\r\n");
                             
                             if misc::crc::invalidate_firmware(&peripherals, firmware_target) {
-                                uart.send_string("\r\nFirmware invalidated successfully.\r\n");
+                                uart.send_string("\r\n\x1B[93mFirmware invalidated successfully.\x1B[0m\r\n");
                             } else {
-                                uart.send_string("\r\nFailed to invalidate firmware!\r\n");
+                                uart.send_string("\r\n\x1B[31mFailed to invalidate firmware!\x1B[0m\r\n");
                             }
                             
                             for _ in 0..150 {
@@ -555,7 +553,7 @@ fn main() -> ! {
                             xmodem_error_occurred = true;
                             leds.set(2, true);
                         } else {
-                            uart.send_string("\r\nCRC verification successful!\r\n");
+                            uart.send_string("\r\n\x1B[32mCRC verification successful!\x1B[0m\r\n");
                             
                             for _ in 0..150 {
                                 uart.process();
@@ -570,7 +568,10 @@ fn main() -> ! {
                     },
                     Err(XmodemError::Cancelled) => {
                         // abortion
-                        uart.send_string("\r\nTransfer cancelled.\r\n");
+                        uart.send_string("\r\n\x1B[31mTransfer cancelled.\x1B[0m\r\n");
+                        for _ in 0..150 {
+                            uart.process();
+                        }
                         
                         while !uart.is_tx_complete() {
                             uart.process();
@@ -581,7 +582,7 @@ fn main() -> ! {
                     },
                     Err(XmodemError::Timeout) => {
                         // timeout
-                        uart.send_string("\r\nTransfer timed out.\r\n");
+                        uart.send_string("\r\n\x1B[31mTransfer timed out.\x1B[0m\r\n");
                         
                         while !uart.is_tx_complete() {
                             uart.process();
@@ -608,7 +609,7 @@ fn main() -> ! {
                         send_cancel_sequence(&mut uart);
 
                         // flash error processing
-                        uart.send_string("\r\nError writing to flash memory.\r\n");
+                        uart.send_string("\r\n\x1B[31mError writing to flash memory.\x1B[0m\r\n");
                         
                         while !uart.is_tx_complete() {
                             uart.process();
@@ -623,7 +624,7 @@ fn main() -> ! {
                         send_cancel_sequence(&mut uart);
                         
                         // invalid magic
-                        uart.send_string("\r\nInvalid firmware image magic number.\r\n");
+                        uart.send_string("\r\n\x1B[31mInvalid firmware image magic number.\x1B[0m\r\n");
                         
                         while !uart.is_tx_complete() {
                             uart.process();
@@ -653,7 +654,7 @@ fn main() -> ! {
             // check for errors
             if xmodem.get_state() == XmodemState::Error {
                 // general error processing
-                uart.send_string("\r\nXMODEM transfer error. Aborting.\r\n");
+                uart.send_string("\r\n\x1B[31mXMODEM transfer error. Aborting.\x1B[0m\r\n");
                 
                 while !uart.is_tx_complete() {
                     uart.process();
@@ -677,7 +678,7 @@ fn main() -> ! {
                     bootloader::boot_application(&p, &mut cp, &boot_config);
                 } else {
                     clear_screen(&mut uart);
-                    uart.send_string("\r\nApplication validation failed just before boot\r\n");
+                    uart.send_string("\r\n\x1B[31mApplication validation failed just before boot\x1B[0m\r\n");
                     boot_option = BootOption::None;
                     systick::wait_ms(systick::get_tick_ms(), 1500);
                     display_menu(&mut uart);
@@ -702,7 +703,7 @@ fn main() -> ! {
             
             if current_time.wrapping_sub(autoboot_timer) >= BOOT_TIMEOUT_MS {
                 if check_application_valid(&mut uart, &boot_config) {
-                    uart.send_string("\r\n Auto-boot timeout reached. Booting application...\r\n");
+                    uart.send_string("\x1B[93m\r\n Auto-boot timeout reached. Booting application...\x1B[0m\r\n");
                     
                     for _ in 0..5 {
                         uart.process();
@@ -715,7 +716,7 @@ fn main() -> ! {
                     
                     boot_option = BootOption::Application;
                 } else {
-                    uart.send_string("\r\n Auto-boot timeout reached but valid application not found!\r\n");
+                    uart.send_string("\x1B[31m\r\n Auto-boot timeout reached but valid application not found!\x1B[0m\r\n");
                     
                     for _ in 0..5 {
                         uart.process();
